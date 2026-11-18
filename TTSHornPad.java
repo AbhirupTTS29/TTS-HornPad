@@ -453,6 +453,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         int xf;            // cross-fade length (frames)
         float corr = 1f;   // how well the seam matches (1 = same waveform)
         float seamGain = 1f;
+        boolean tailOk;    // what follows the loop body really dies away (horn release), not more of the sound
     }
 
     static Snd readWav(File f) {
@@ -632,6 +633,34 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         }
         s.corr = (saa > 0 && sbb > 0) ? (float) Math.max(-1, Math.min(1, sab / Math.sqrt(saa * sbb))) : 0f;
         s.seamGain = (saa > 0 && sbb > 0) ? (float) Math.min(1.5, Math.max(0.67, Math.sqrt(sbb / saa))) : 1f;
+        s.tailOk = tailDecays(s);
+    }
+
+    /**
+     * The part after the loop body is used as the release only if it really dies away: within 1.2 s its level
+     * must fall below 40 % of the level where it starts, and it must not be longer than 4 s.  A bell recording
+     * that just goes on ringing (or a horn file with a second blast) fails this and gets a short fade instead.
+     */
+    static boolean tailDecays(Snd s) {
+        int tail = s.frames - s.loopB;
+        if (tail < RATE / 5 || tail > RATE * 4) return false;
+        int w = RATE / 10;
+        double a = rms(s, s.loopB, w);
+        int far = Math.min(s.frames - w, s.loopB + RATE * 12 / 10);
+        double b = rms(s, far, w);
+        double end = rms(s, s.frames - w, w);
+        return a > 0 && b < a * 0.40 && end < a * 0.25;
+    }
+
+    static double rms(Snd s, int from, int n) {
+        double sum = 0;
+        int c = 0;
+        for (int i = Math.max(0, from); i < Math.min(s.frames, from + n); i++) {
+            float l = s.pcm[2 * i], r = s.pcm[2 * i + 1];
+            sum += l * l + r * r;
+            c += 2;
+        }
+        return c > 0 ? Math.sqrt(sum / c) : 0;
     }
 
     static int le16(byte[] b, int p) { return (b[p] & 255) | ((b[p + 1] & 255) << 8); }
@@ -736,17 +765,17 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             }
         }
 
-        /** let go: into the recorded ending (horn tail) or, without one, a smooth 0.45 s fade */
+        /** let go: into the recorded ending (horn tail) or, without a real one (bell), a quick fade */
         static void startRelease(Voice o) {
             Snd s = o.s;
-            int tail = s.frames - s.loopB;
+            int tail = s.tailOk ? s.frames - s.loopB : 0;
             if (o.pos >= s.loopB) return;                       // already in the ending
             if (o.pos < s.loopA) {                              // still in the attack: just play on
                 if (tail >= RATE / 5) {
                     o.tailPos = s.loopB - Math.min(s.loopB - o.pos, RATE / 20);
                     o.tailN = Math.max(1, Math.min(RATE / 20, s.loopB - o.pos));
                     o.tailK = 0;
-                } else o.fadeMul = (float) Math.exp(Math.log(0.001) / (RATE * 0.45));
+                } else o.fadeMul = (float) Math.exp(Math.log(0.001) / (RATE * 0.35));
                 return;
             }
             if (tail >= RATE / 5) {
@@ -754,7 +783,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 o.tailN = RATE * 80 / 1000;
                 o.tailK = 0;
             } else {
-                o.fadeMul = (float) Math.exp(Math.log(0.001) / (RATE * 0.45));   // -60 dB in 0.45 s
+                o.fadeMul = (float) Math.exp(Math.log(0.001) / (RATE * 0.35));   // -60 dB in 0.35 s
             }
         }
 
@@ -908,10 +937,14 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         AudioTrack track;
         final java.util.Random rnd = new java.util.Random();
         float level = 0f;                     // smoothed rain level 0..1
-        // noise filter state (stereo)
-        float b0L, b1L, b2L, b0R, b1R, b2R, lpL, lpR, hpL, hpR, hpXL, hpXR;
-        // drops
-        float dropEnv, dropPan, dropF, dropPh;
+        // rain layers (stereo): wash (band-limited pink noise), patter (dense soft taps), near drops, roar
+        float b0L, b1L, b2L, b0R, b1R, b2R;
+        float w1L, w2L, w1R, w2R, hL, hR, hxL, hxR;
+        float tapL, tapR, tapLp, tapRp;
+        float dropEnv, dropPan, dropY1, dropY2, dropA1, dropA2;
+        float roar1, roar2;
+        float gust = 1f, gustT = 1f;
+        int gustN;
         // thunder
         short[] thunder;                      // prepared rumble (mono)
         int thPos = -1;
@@ -1011,30 +1044,56 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             if (!storm && thPos < 0) nextThunder = 0;
             for (int i = 0; i < chunk; i++) {
                 level += (tgt - level) * (1f / (RATE * 2.5f));      // rain swells / dies away over a few seconds
+                if (--gustN <= 0) {                                  // gusts: the rain comes in waves
+                    gustT = 0.78f + 0.44f * rnd.nextFloat();
+                    gustN = RATE * 2 + rnd.nextInt(RATE * 4);
+                }
+                gust += (gustT - gust) * (1f / (RATE * 1.5f));
                 float wL = rnd.nextFloat() * 2f - 1f, wR = rnd.nextFloat() * 2f - 1f;
-                // pink-ish noise (Paul Kellet, economy)
+                // 1. wash: pink noise (Kellet economy), low-passed twice (~3 kHz) and high-passed (~150 Hz)
                 b0L = 0.99765f * b0L + wL * 0.0990460f; b1L = 0.96300f * b1L + wL * 0.2965164f; b2L = 0.57000f * b2L + wL * 1.0526913f;
                 b0R = 0.99765f * b0R + wR * 0.0990460f; b1R = 0.96300f * b1R + wR * 0.2965164f; b2R = 0.57000f * b2R + wR * 1.0526913f;
                 float pL = (b0L + b1L + b2L + wL * 0.1848f) * 0.11f, pR = (b0R + b1R + b2R + wR * 0.1848f) * 0.11f;
-                // wash (low-passed) + hiss (high-passed white)
-                lpL += (pL - lpL) * 0.18f; lpR += (pR - lpR) * 0.18f;
-                hpL = 0.92f * (hpL + wL - hpXL); hpXL = wL; hpR = 0.92f * (hpR + wR - hpXR); hpXR = wR;
-                float L = lpL * 0.9f + hpL * 0.10f, R = lpR * 0.9f + hpR * 0.10f;
-                // single drops: short decaying pings, more of them in heavy rain
-                if (dropEnv < 0.01f && rnd.nextFloat() < 0.0009f * (0.3f + level * 3f)) {
-                    dropEnv = 0.25f + rnd.nextFloat() * 0.5f;
+                w1L += (pL - w1L) * 0.36f; w2L += (w1L - w2L) * 0.36f;
+                w1R += (pR - w1R) * 0.36f; w2R += (w1R - w2R) * 0.36f;
+                hL = 0.979f * (hL + w2L - hxL); hxL = w2L;
+                hR = 0.979f * (hR + w2R - hxR); hxR = w2R;
+                float L = hL * 1.6f, R = hR * 1.6f;
+                // 2. patter: many small soft taps (decay ~4 ms, low-passed) - the texture of rain, no sizzle
+                float rate = (0.004f + 0.012f * level) * gust;
+                if (rnd.nextFloat() < rate) tapL = (rnd.nextFloat() * 0.6f + 0.2f) * (rnd.nextBoolean() ? 1f : -1f);
+                if (rnd.nextFloat() < rate) tapR = (rnd.nextFloat() * 0.6f + 0.2f) * (rnd.nextBoolean() ? 1f : -1f);
+                tapLp += (tapL * (rnd.nextFloat() + 0.5f) - tapLp) * 0.30f;
+                tapRp += (tapR * (rnd.nextFloat() + 0.5f) - tapRp) * 0.30f;
+                tapL *= 0.9945f;
+                tapR *= 0.9945f;
+                L += tapLp * 0.22f;
+                R += tapRp * 0.22f;
+                // 3. a few bigger drops near by (roof, cab): a short low "plip" (resonant filter, 1-2 kHz)
+                if (dropEnv < 0.002f && rnd.nextFloat() < 0.00012f * (0.4f + level * 2f)) {
+                    dropEnv = 0.18f + rnd.nextFloat() * 0.25f;
                     dropPan = rnd.nextFloat();
-                    dropF = (1800f + rnd.nextFloat() * 3500f) * 6.2831853f / RATE;
-                    dropPh = 0f;
+                    float f = (900f + rnd.nextFloat() * 1100f) * 6.2831853f / RATE;
+                    float rr = 0.9975f;
+                    dropA1 = 2f * rr * (float) Math.cos(f);
+                    dropA2 = -rr * rr;
+                    dropY1 = dropY2 = 0f;
                 }
-                if (dropEnv >= 0.01f) {
-                    dropPh += dropF;
-                    float d = (float) Math.sin(dropPh) * dropEnv * 0.25f;
-                    L += d * (1f - dropPan);
-                    R += d * dropPan;
-                    dropEnv *= 0.9965f;
+                if (dropEnv >= 0.002f) {
+                    float y = dropA1 * dropY1 + dropA2 * dropY2 + (rnd.nextFloat() - 0.5f) * dropEnv * 0.08f;
+                    dropY2 = dropY1;
+                    dropY1 = y;
+                    L += y * (1f - dropPan) * 0.9f;
+                    R += y * dropPan * 0.9f;
+                    dropEnv *= 0.9985f;
                 }
-                float g = level * 0.8f;
+                // 4. heavy rain / storm: a low roar
+                roar1 += ((wL + wR) * 0.5f - roar1) * 0.010f;
+                roar2 += (roar1 - roar2) * 0.010f;
+                float roar = roar2 * 6f * Math.max(0f, level - 0.5f) * 2f;
+                L += roar;
+                R += roar;
+                float g = level * 0.65f * gust;
                 L *= g;
                 R *= g;
                 if (thPos >= 0) {
