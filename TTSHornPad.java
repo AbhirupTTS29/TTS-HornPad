@@ -642,7 +642,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
      */
     /**
      * r123: horn files come in at any level (many are cut to full scale - with the ground bounce and the old
-     * hard clip that "cracked" the phone speaker).  The steady body is brought to -15 dBFS RMS (at most +6 dB
+     * hard clip that "cracked" the phone speaker).  The steady body is brought to -16 dBFS RMS (at most +6 dB
      * up, any amount down); the limiter at the output keeps every peak under -1 dBFS.
      */
     static void loudness(Snd s) {
@@ -658,7 +658,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         }
         double rms = Math.sqrt(e / Math.max(1, b - a)) / 32768.0;
         if (rms < 1e-5) return;
-        float g = (float) (0.178 / rms);
+        float g = (float) (0.16 / rms);
         if (g > 2f) g = 2f;
         s.norm = g;
     }
@@ -1147,29 +1147,56 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         }
 
         /**
-         * r123: peak limiter (no more hard clipping = no "cracking" in the phone speaker).  Ceiling -3 dBFS,
-         * the gain falls at once when a peak comes and recovers in 0.25 s; a soft knee above -4.4 dBFS.
+         * r124: look-ahead peak limiter.  r123 dropped the gain at the very sample of a new peak (and had a
+         * tanh knee from -4.4 dBFS): while the horn swelled up at its start every new cycle was flattened =
+         * the crackle "at first".  Now the sound is delayed 2.5 ms and the gain glides down BEFORE a peak
+         * arrives (no waveform is ever cut), recovers in 0.2 s.  Ceiling -6 dBFS: the game's own sound
+         * (peaks about -9 dBFS) is mixed with ours in the phone, the sum must stay under full scale.
          */
-        float limEnv = 0f;
+        static final int LA = 110;                       // 2.5 ms at 44.1 kHz
+        static final int HOLD = 1323;                    // 30 ms: longer than one cycle of the lowest horn
+        final float[] laBuf = new float[2 * LA];
+        int laPos;
+        float limG = 1f;
+        // sliding minimum of the wanted gain over the last HOLD samples (monotonic queue, ring buffers)
+        final float[] mqV = new float[HOLD + 1];
+        final long[] mqT = new long[HOLD + 1];
+        int mqHead, mqTail;
+        long mqNow;
 
         void limit(float[] acc, int chunk) {
-            final float ceil = 0.71f;          // -3 dBFS: room for the game's own sound in the phone's mixer
-            final float rel = (float) Math.exp(-1.0 / (RATE * 0.25));
+            final float ceil = 0.5f;
+            final float att = (float) (1.0 - Math.exp(-5.0 / LA));
+            final float rel = (float) (1.0 - Math.exp(-1.0 / (RATE * 0.2)));
+            final int cap = HOLD + 1;
             for (int i = 0; i < chunk; i++) {
                 float l = acc[2 * i], r = acc[2 * i + 1];
                 float pk = Math.max(Math.abs(l), Math.abs(r));
-                limEnv = pk > limEnv ? pk : limEnv * rel + pk * (1f - rel);
-                float g = limEnv > ceil ? ceil / limEnv : 1f;
-                acc[2 * i] = soft(l * g);
-                acc[2 * i + 1] = soft(r * g);
+                float want = pk > ceil ? ceil / pk : 1f;
+                long t = mqNow++;
+                while (mqTail != mqHead && mqV[(mqTail - 1 + cap) % cap] >= want)
+                    mqTail = (mqTail - 1 + cap) % cap;
+                mqV[mqTail] = want;
+                mqT[mqTail] = t;
+                mqTail = (mqTail + 1) % cap;
+                while (mqT[mqHead] <= t - HOLD) mqHead = (mqHead + 1) % cap;
+                float holdG = mqV[mqHead];
+                if (holdG < limG) limG += (holdG - limG) * att;
+                else limG += (holdG - limG) * rel;
+                float dl = laBuf[2 * laPos], dr = laBuf[2 * laPos + 1];
+                laBuf[2 * laPos] = l;
+                laBuf[2 * laPos + 1] = r;
+                laPos = laPos + 1 == LA ? 0 : laPos + 1;
+                dl *= limG;
+                dr *= limG;
+                // safety only (the glide above keeps the delayed sample under the ceiling)
+                if (dl > ceil) dl = ceil;
+                if (dl < -ceil) dl = -ceil;
+                if (dr > ceil) dr = ceil;
+                if (dr < -ceil) dr = -ceil;
+                acc[2 * i] = dl;
+                acc[2 * i + 1] = dr;
             }
-        }
-
-        static float soft(float x) {
-            float a = Math.abs(x);
-            if (a <= 0.6f) return x;
-            float y = 0.6f + 0.15f * (float) Math.tanh((a - 0.6f) / 0.15f);
-            return x < 0 ? -y : y;
         }
 
         void hear(float[] acc, int chunk) {
