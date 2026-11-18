@@ -1060,33 +1060,16 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 hR = 0.979f * (hR + w2R - hxR); hxR = w2R;
                 float L = hL * 1.6f, R = hR * 1.6f;
                 // 2. patter: many small soft taps (decay ~4 ms, low-passed) - the texture of rain, no sizzle
-                float rate = (0.004f + 0.012f * level) * gust;
+                float rate = (0.010f + 0.025f * level) * gust;          // denser and softer: a hiss of taps, no single ones
                 if (rnd.nextFloat() < rate) tapL = (rnd.nextFloat() * 0.6f + 0.2f) * (rnd.nextBoolean() ? 1f : -1f);
                 if (rnd.nextFloat() < rate) tapR = (rnd.nextFloat() * 0.6f + 0.2f) * (rnd.nextBoolean() ? 1f : -1f);
-                tapLp += (tapL * (rnd.nextFloat() + 0.5f) - tapLp) * 0.30f;
-                tapRp += (tapR * (rnd.nextFloat() + 0.5f) - tapRp) * 0.30f;
+                tapLp += (tapL * (rnd.nextFloat() + 0.5f) - tapLp) * 0.18f;
+                tapRp += (tapR * (rnd.nextFloat() + 0.5f) - tapRp) * 0.18f;
                 tapL *= 0.9945f;
                 tapR *= 0.9945f;
-                L += tapLp * 0.22f;
-                R += tapRp * 0.22f;
-                // 3. a few bigger drops near by (roof, cab): a short low "plip" (resonant filter, 1-2 kHz)
-                if (dropEnv < 0.002f && rnd.nextFloat() < 0.00012f * (0.4f + level * 2f)) {
-                    dropEnv = 0.18f + rnd.nextFloat() * 0.25f;
-                    dropPan = rnd.nextFloat();
-                    float f = (900f + rnd.nextFloat() * 1100f) * 6.2831853f / RATE;
-                    float rr = 0.9975f;
-                    dropA1 = 2f * rr * (float) Math.cos(f);
-                    dropA2 = -rr * rr;
-                    dropY1 = dropY2 = 0f;
-                }
-                if (dropEnv >= 0.002f) {
-                    float y = dropA1 * dropY1 + dropA2 * dropY2 + (rnd.nextFloat() - 0.5f) * dropEnv * 0.08f;
-                    dropY2 = dropY1;
-                    dropY1 = y;
-                    L += y * (1f - dropPan) * 0.9f;
-                    R += y * dropPan * 0.9f;
-                    dropEnv *= 0.9985f;
-                }
+                L += tapLp * 0.12f;
+                R += tapRp * 0.12f;
+                // (r115b: no single near drops any more - they sounded like dripping "top top")
                 // 4. heavy rain / storm: a low roar
                 roar1 += ((wL + wR) * 0.5f - roar1) * 0.010f;
                 roar2 += (roar1 - roar2) * 0.010f;
