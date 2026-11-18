@@ -24,11 +24,16 @@ import android.view.HapticFeedbackConstants;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.Window;
 import android.widget.FrameLayout;
 
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.RandomAccessFile;
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.util.HashMap;
 import java.util.Locale;
 
@@ -38,8 +43,9 @@ import java.util.Locale;
  * Drag the knob towards a side and hold: up = horn.wav, right = extra.wav, down = idle 1.wav (bell),
  * left = sander1.wav.  The sound loops while the finger stays there and finishes naturally when it is
  * released.  The files come from the horn asset of the driven loco, which the HUD script writes to
- * Trainz.log ("TTSJOY: on <kuid:..> x= y= d=" / "TTSJOY: off").  Long-press the knob = move the
- * whole pad with the finger; the place is remembered.
+ * Trainz.log ("TTSJOY: on <kuid:..> x= y= d=" / "TTSJOY: off").  Long-press the knob = settings:
+ * move, bigger / smaller, hide (small HORN button) - all remembered.  r117: the pad's finger is taken out
+ * of the game's touches only, so camera and other controls keep working while the horn is held.
  *
  * Started by the system as a ContentProvider (AndroidManifest), so no existing class is changed.
  * Everything is inside try / catch: the pad can never take the game down.
@@ -92,6 +98,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 State last = watcher.last;
                 if (last != null) pad.setState(last);     // the HUD said its state before this pad existed
             }
+            installRouter(a);
             watcher.start(a);
             weather.setPaused(false);
         } catch (Throwable t) {
@@ -120,6 +127,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 weather.setRain(0);
                 owner = null;
                 pad = null;
+                if (routedFor == a) routedFor = null;
             }
         } catch (Throwable t) {
             log("destroy: " + t);
@@ -1137,30 +1145,185 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         }
     }
 
+    // ================================================================ touch router
+    /**
+     * The game reads touches in its Activity.onTouchEvent, which only runs when no view takes the
+     * gesture.  A pad view that took its finger therefore froze every other control and the free camera
+     * while the horn was held.  This wrapper sits in front of the window: the pad's finger goes to the
+     * pad only, and the game gets the same event with that finger taken out (its own DOWN / UP when its
+     * first finger comes or its last finger goes), so camera and controls keep working during the horn.
+     */
+    static Router router;
+    static Activity routedFor;
+
+    static void installRouter(Activity a) {
+        try {
+            if (routedFor == a) return;
+            Window w = a.getWindow();
+            if (w == null) return;
+            Window.Callback cb = w.getCallback();
+            if (cb == null) return;
+            if (Proxy.isProxyClass(cb.getClass()) && Proxy.getInvocationHandler(cb) instanceof Router) {
+                routedFor = a;
+                return;
+            }
+            Router r = new Router(cb);
+            Window.Callback p = (Window.Callback) Proxy.newProxyInstance(TTSHornPad.class.getClassLoader(),
+                    new Class<?>[]{Window.Callback.class}, r);
+            w.setCallback(p);
+            router = r;
+            routedFor = a;
+            log("router on");
+        } catch (Throwable t) {
+            log("router: " + t);
+            routedFor = null;
+        }
+    }
+
+    static final class Router implements InvocationHandler {
+        final Window.Callback orig;
+        int padId = -1;            // pointer id held by the pad
+        long gameDown;             // down time of the game's own part of the gesture
+
+        Router(Window.Callback o) {
+            orig = o;
+        }
+
+        public Object invoke(Object proxy, Method m, Object[] args) throws Throwable {
+            String n = m.getName();
+            if (args != null && args.length == 1 && args[0] instanceof MotionEvent && "dispatchTouchEvent".equals(n)) {
+                MotionEvent ev = (MotionEvent) args[0];
+                try {
+                    return route(ev);
+                } catch (Throwable t) {
+                    log("route: " + t);
+                    padId = -1;
+                    return orig.dispatchTouchEvent(ev);
+                }
+            }
+            if ("equals".equals(n) && args != null && args.length == 1) return proxy == args[0];
+            if ("hashCode".equals(n) && (args == null || args.length == 0)) return System.identityHashCode(proxy);
+            if ("toString".equals(n) && (args == null || args.length == 0)) return "TTSHornPad.Router";
+            try {
+                return m.invoke(orig, args);
+            } catch (InvocationTargetException e) {
+                throw e.getCause();
+            }
+        }
+
+        boolean route(MotionEvent ev) {
+            PadView p = pad;
+            int act = ev.getActionMasked();
+            int ai = ev.getActionIndex();
+            if (act == MotionEvent.ACTION_DOWN) {
+                if (padId >= 0 && p != null) p.lift(true);
+                padId = -1;
+            }
+            if ((act == MotionEvent.ACTION_DOWN || act == MotionEvent.ACTION_POINTER_DOWN) && padId < 0
+                    && p != null && p.claim(ev.getX(ai), ev.getY(ai))) {
+                padId = ev.getPointerId(ai);
+                return forward(ev, act, ai);          // the game sees the other fingers only
+            }
+            if (padId < 0) {
+                gameDown = ev.getDownTime();
+                return orig.dispatchTouchEvent(ev);
+            }
+            int pi = ev.findPointerIndex(padId);
+            boolean padGone = act == MotionEvent.ACTION_CANCEL
+                    || ((act == MotionEvent.ACTION_UP || act == MotionEvent.ACTION_POINTER_UP) && ai == pi);
+            if (p != null) {
+                if (padGone) p.lift(act == MotionEvent.ACTION_CANCEL);
+                else if (pi >= 0 && act == MotionEvent.ACTION_MOVE) p.drag(ev.getX(pi), ev.getY(pi));
+            }
+            boolean r = forward(ev, act, ai);
+            if (padGone || pi < 0) padId = -1;
+            return r;
+        }
+
+        boolean forward(MotionEvent ev, int act, int ai) {
+            int n = ev.getPointerCount();
+            int si = ev.findPointerIndex(padId);
+            if (si < 0) {
+                if (act == MotionEvent.ACTION_DOWN) gameDown = ev.getDownTime();
+                return orig.dispatchTouchEvent(ev);
+            }
+            int m = n - 1;
+            if (m <= 0) return true;                   // only the pad's finger
+            MotionEvent.PointerProperties[] pp = new MotionEvent.PointerProperties[m];
+            MotionEvent.PointerCoords[] pc = new MotionEvent.PointerCoords[m];
+            int j = 0, nai = 0;
+            for (int i = 0; i < n; i++) {
+                if (i == si) continue;
+                pp[j] = new MotionEvent.PointerProperties();
+                ev.getPointerProperties(i, pp[j]);
+                pc[j] = new MotionEvent.PointerCoords();
+                ev.getPointerCoords(i, pc[j]);
+                if (i == ai) nai = j;
+                j++;
+            }
+            int na;
+            if (ai == si && act != MotionEvent.ACTION_MOVE && act != MotionEvent.ACTION_CANCEL) {
+                na = MotionEvent.ACTION_MOVE;          // the pad's finger came or went: nothing new for the game
+            } else if (act == MotionEvent.ACTION_POINTER_DOWN) {
+                na = m == 1 ? MotionEvent.ACTION_DOWN
+                        : (MotionEvent.ACTION_POINTER_DOWN | (nai << MotionEvent.ACTION_POINTER_INDEX_SHIFT));
+            } else if (act == MotionEvent.ACTION_POINTER_UP) {
+                na = m == 1 ? MotionEvent.ACTION_UP
+                        : (MotionEvent.ACTION_POINTER_UP | (nai << MotionEvent.ACTION_POINTER_INDEX_SHIFT));
+            } else {
+                na = act;
+            }
+            if (na == MotionEvent.ACTION_DOWN) gameDown = ev.getEventTime();
+            MotionEvent e2 = MotionEvent.obtain(gameDown, ev.getEventTime(), na, m, pp, pc, ev.getMetaState(),
+                    ev.getButtonState(), ev.getXPrecision(), ev.getYPrecision(), ev.getDeviceId(),
+                    ev.getEdgeFlags(), ev.getSource(), ev.getFlags());
+            try {
+                return orig.dispatchTouchEvent(e2);
+            } finally {
+                e2.recycle();
+            }
+        }
+    }
+
     // ================================================================ the pad
     static final int[] DIR_COL_OFF = {0, 0xFF8FA2C4, 0xFF8FA2C4, 0xFF8FA2C4, 0xFF8FA2C4};
     static final String[] LABEL = {"", "HORN", "EXTRA", "BELL", "SAND"};
+    static final String[] EDIT_LABEL = {"", "+", "OK", "−", "HIDE"};
+    static final float MIN_SCALE = 0.5f, MAX_SCALE = 1.8f;
 
+    /**
+     * The pad.  Long-press the knob = SETTINGS (orange): drag the knob to move the pad, tap "+" / "-" to make
+     * it bigger / smaller, "HIDE" folds it into a small round horn button (tap it to open the pad again,
+     * drag it to move it), "OK" ends the settings.  Place, size and hidden state are remembered.  The pad
+     * has its own hide; the HUD's "TTS hide" no longer touches it.
+     */
     static final class PadView extends View {
         final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
         final Paint text = new Paint(Paint.ANTI_ALIAS_FLAG);
         final Path path = new Path();
         final float dpi;
+        final int[] loc = new int[2];
         State st = new State();
         boolean userPlaced;
-        float ux, uy;                  // user place, parts of the screen
+        float ux, uy;                  // user place (top-left), parts of the screen
+        float scale = 1f;              // user size
+        boolean hidden;                // folded into the small horn button
         int size = 10;
-        // touch
-        int pid = -1;
+        // touch (window coordinates, fed by the Router)
+        boolean held;
         float kx, ky;                  // knob offset from the centre (px)
         int dir;                       // side held: 0 none, 1 up, 2 right, 3 down, 4 left
-        boolean moving;                // long-press: the whole pad follows the finger
-        float downRawX, downRawY;
+        boolean edit;                  // settings mode
+        boolean editDrag;              // settings: the pad follows the finger
+        int editAct;                   // settings: side touched (tap on release)
+        boolean miniTap, miniDrag;
+        float downX, downY;
         int startLeft, startTop;
         final Runnable longPress = new Runnable() {
             public void run() {
-                if (pid >= 0 && dir == 0) {
-                    moving = true;
+                if (held && dir == 0 && !edit && !hidden) {
+                    edit = true;
+                    editDrag = true;
                     kx = 0;
                     ky = 0;
                     performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
@@ -1168,9 +1331,17 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 }
             }
         };
+        final Runnable editEnd = new Runnable() {
+            public void run() {
+                if (edit && !held) {
+                    edit = false;
+                    invalidate();
+                }
+            }
+        };
         final Runnable spring = new Runnable() {
             public void run() {
-                if (pid >= 0) return;
+                if (held && !edit) return;
                 kx *= 0.55f;
                 ky *= 0.55f;
                 if (Math.abs(kx) < 1 && Math.abs(ky) < 1) {
@@ -1194,6 +1365,8 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 userPlaced = sp.getBoolean("placed", false);
                 ux = sp.getFloat("x", 0.2f);
                 uy = sp.getFloat("y", 0.32f);
+                scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, sp.getFloat("scale", 1f)));
+                hidden = sp.getBoolean("hidden", false);
             } catch (Throwable t) {
                 userPlaced = false;
             }
@@ -1203,6 +1376,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             st = s;
             if (!s.on) {
                 dropTouch();
+                edit = false;
                 setVisibility(View.GONE);
                 return;
             }
@@ -1211,17 +1385,30 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             invalidate();
         }
 
-        void place() {
+        int screenW() {
             View root = getRootView();
-            int sw = root != null ? root.getWidth() : 0;
-            int sh = root != null ? root.getHeight() : 0;
-            if (sw <= 0 || sh <= 0) {
-                DisplayMetrics m = getResources().getDisplayMetrics();
-                sw = m.widthPixels;
-                sh = m.heightPixels;
-            }
-            int d = (int) (st.d * sh);
-            if (d < 120) d = 120;
+            int w = root != null ? root.getWidth() : 0;
+            return w > 0 ? w : getResources().getDisplayMetrics().widthPixels;
+        }
+
+        int screenH() {
+            View root = getRootView();
+            int h = root != null ? root.getHeight() : 0;
+            return h > 0 ? h : getResources().getDisplayMetrics().heightPixels;
+        }
+
+        int fullSize() {
+            int d = (int) (st.d * screenH() * scale);
+            return Math.max((int) (dpi * 0.45f), Math.min(d, (int) (screenH() * 0.9f)));
+        }
+
+        int miniSize() {
+            return Math.max(56, (int) (dpi * 0.36f));
+        }
+
+        void place() {
+            int sw = screenW(), sh = screenH();
+            int d = hidden ? miniSize() : fullSize();
             float fx = userPlaced ? ux : st.x;
             float fy = userPlaced ? uy : st.y;
             int left = (int) (fx * sw);
@@ -1247,67 +1434,155 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             removeCallbacks(longPress);
             if (dir != 0) mixer.release(dir);
             dir = 0;
-            pid = -1;
-            moving = false;
+            held = false;
+            editDrag = false;
+            editAct = 0;
+            miniTap = false;
+            miniDrag = false;
             post(spring);
         }
 
+        /** fallback when the window router could not be installed: the view gets its own touches */
         @Override
         public boolean onTouchEvent(MotionEvent e) {
+            if (routedFor != null && routedFor == owner) return false;
             try {
-                return touch(e);
+                int act = e.getActionMasked();
+                if (act == MotionEvent.ACTION_DOWN) return claim(e.getRawX(), e.getRawY());
+                if (act == MotionEvent.ACTION_MOVE) drag(e.getRawX(), e.getRawY());
+                else if (act == MotionEvent.ACTION_UP || act == MotionEvent.ACTION_CANCEL) lift(act == MotionEvent.ACTION_CANCEL);
+                return held;
             } catch (Throwable t) {
                 log("touch: " + t);
                 return false;
             }
         }
 
-        boolean touch(MotionEvent e) {
-            int act = e.getActionMasked();
-            float c = getWidth() / 2f;
-            float R = c - 2;
-            if (act == MotionEvent.ACTION_DOWN) {
-                float dx = e.getX() - c, dy = e.getY() - c;
-                if (dx * dx + dy * dy > R * R) return false;      // outside the circle: the game gets it
-                pid = e.getPointerId(0);
-                downRawX = e.getRawX();
-                downRawY = e.getRawY();
-                FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) getLayoutParams();
-                startLeft = lp.leftMargin;
-                startTop = lp.topMargin;
-                removeCallbacks(spring);
-                float rk = R * 0.27f;
-                if (dx * dx + dy * dy < rk * rk * 1.6f) postDelayed(longPress, 550);
-                follow(dx, dy);
-                return true;
-            }
-            int idx = pid >= 0 ? e.findPointerIndex(pid) : -1;
-            if (idx < 0) return pid >= 0;
-            if (act == MotionEvent.ACTION_MOVE) {
-                if (moving) {
-                    FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) getLayoutParams();
-                    View root = getRootView();
-                    int sw = root.getWidth(), sh = root.getHeight();
-                    int nl = startLeft + (int) (e.getRawX() - downRawX);
-                    int nt = startTop + (int) (e.getRawY() - downRawY);
-                    lp.leftMargin = Math.max(0, Math.min(nl, sw - getWidth()));
-                    lp.topMargin = Math.max(0, Math.min(nt, sh - getHeight()));
-                    setLayoutParams(lp);
-                    return true;
-                }
-                float mx = e.getRawX() - downRawX, my = e.getRawY() - downRawY;
-                if (mx * mx + my * my > 18 * 18) removeCallbacks(longPress);
-                follow(e.getX(idx) - c, e.getY(idx) - c);
-                return true;
-            }
-            if (act == MotionEvent.ACTION_UP || act == MotionEvent.ACTION_CANCEL
-                    || (act == MotionEvent.ACTION_POINTER_UP && e.getPointerId(e.getActionIndex()) == pid)) {
-                if (moving) savePlace();
-                dropTouch();
+        /** a finger came down at window (x, y): true = it is on the pad and the pad keeps it */
+        boolean claim(float wx, float wy) {
+            if (getVisibility() != View.VISIBLE || getWidth() <= 0) return false;
+            getLocationInWindow(loc);
+            float c = getWidth() / 2f, R = c - 2;
+            float dx = wx - loc[0] - c, dy = wy - loc[1] - c;
+            if (dx * dx + dy * dy > R * R) return false;          // outside the circle: the game gets it
+            held = true;
+            downX = wx;
+            downY = wy;
+            FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) getLayoutParams();
+            startLeft = lp.leftMargin;
+            startTop = lp.topMargin;
+            removeCallbacks(spring);
+            removeCallbacks(editEnd);
+            if (hidden) {
+                miniTap = true;
+                miniDrag = false;
                 invalidate();
                 return true;
             }
+            float rk = R * 0.27f;
+            if (edit) {
+                editDrag = dx * dx + dy * dy < rk * rk * 2.2f;
+                editAct = 0;
+                if (!editDrag) {
+                    if (Math.abs(dx) > Math.abs(dy)) editAct = dx > 0 ? 2 : 4;
+                    else editAct = dy < 0 ? 1 : 3;
+                }
+                invalidate();
+                return true;
+            }
+            if (dx * dx + dy * dy < rk * rk * 1.6f) postDelayed(longPress, 550);
+            follow(dx, dy);
             return true;
+        }
+
+        void drag(float wx, float wy) {
+            if (!held) return;
+            float mx = wx - downX, my = wy - downY;
+            float far = mx * mx + my * my;
+            if (hidden) {
+                if (far > 22 * 22) {
+                    miniTap = false;
+                    miniDrag = true;
+                }
+                if (miniDrag) movePad(mx, my);
+                return;
+            }
+            if (edit) {
+                if (editDrag) movePad(mx, my);
+                else if (far > 40 * 40 && editAct != 0) {
+                    editAct = 0;
+                    invalidate();
+                }
+                return;
+            }
+            if (far > 18 * 18) removeCallbacks(longPress);
+            getLocationInWindow(loc);
+            float c = getWidth() / 2f;
+            follow(wx - loc[0] - c, wy - loc[1] - c);
+        }
+
+        void lift(boolean cancel) {
+            if (!held) return;
+            held = false;
+            removeCallbacks(longPress);
+            if (hidden) {
+                if (miniDrag) savePlace();
+                else if (miniTap && !cancel) setHidden(false);
+                miniTap = false;
+                miniDrag = false;
+                invalidate();
+                return;
+            }
+            if (edit) {
+                if (editDrag) savePlace();
+                else if (!cancel && editAct != 0) editTap(editAct);
+                editDrag = false;
+                editAct = 0;
+                if (edit) postDelayed(editEnd, 12000);       // settings close by themselves after 12 s
+                invalidate();
+                return;
+            }
+            if (dir != 0) mixer.release(dir);
+            dir = 0;
+            post(spring);
+            invalidate();
+        }
+
+        void editTap(int k) {
+            performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+            if (k == 1 || k == 3) {
+                float ns = Math.round((scale + (k == 1 ? 0.1f : -0.1f)) * 10f) / 10f;
+                scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, ns));
+                savePrefs();
+                place();
+            } else if (k == 4) {
+                edit = false;
+                setHidden(true);
+            } else {
+                edit = false;
+            }
+            invalidate();
+        }
+
+        void setHidden(boolean h) {
+            hidden = h;
+            if (h) {
+                if (dir != 0) mixer.release(dir);
+                dir = 0;
+            }
+            kx = 0;
+            ky = 0;
+            savePrefs();
+            place();
+            invalidate();
+        }
+
+        void movePad(float mx, float my) {
+            FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) getLayoutParams();
+            int sw = screenW(), sh = screenH();
+            lp.leftMargin = Math.max(0, Math.min(startLeft + (int) mx, sw - getWidth()));
+            lp.topMargin = Math.max(0, Math.min(startTop + (int) my, sh - getHeight()));
+            setLayoutParams(lp);
         }
 
         /** knob follows the finger; past 30 % of the radius the side is held */
@@ -1341,25 +1616,52 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
 
         void savePlace() {
             try {
-                View root = getRootView();
                 FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) getLayoutParams();
-                ux = lp.leftMargin / (float) root.getWidth();
-                uy = lp.topMargin / (float) root.getHeight();
+                ux = lp.leftMargin / (float) screenW();
+                uy = lp.topMargin / (float) screenH();
                 userPlaced = true;
-                getContext().getSharedPreferences("tts_hornpad", Context.MODE_PRIVATE).edit()
-                        .putBoolean("placed", true).putFloat("x", ux).putFloat("y", uy).apply();
+                savePrefs();
             } catch (Throwable t) {
                 log("save: " + t);
+            }
+        }
+
+        void savePrefs() {
+            try {
+                getContext().getSharedPreferences("tts_hornpad", Context.MODE_PRIVATE).edit()
+                        .putBoolean("placed", userPlaced).putFloat("x", ux).putFloat("y", uy)
+                        .putFloat("scale", scale).putBoolean("hidden", hidden).apply();
+            } catch (Throwable t) {
+                log("prefs: " + t);
             }
         }
 
         @Override
         protected void onDraw(Canvas cv) {
             try {
-                draw2(cv);
+                if (hidden) drawMini(cv);
+                else draw2(cv);
             } catch (Throwable t) {
                 log("draw: " + t);
             }
+        }
+
+        void drawMini(Canvas cv) {
+            float c = getWidth() / 2f;
+            float R = c - 2;
+            if (R < 6) return;
+            fill.setStyle(Paint.Style.FILL);
+            fill.setColor(miniTap || miniDrag ? 0xE02EA8FF : 0xC80B1322);
+            cv.drawCircle(c, c, R, fill);
+            fill.setStyle(Paint.Style.STROKE);
+            fill.setStrokeWidth(Math.max(2f, R * 0.07f));
+            fill.setColor(0xCC2EA8FF);
+            cv.drawCircle(c, c, R - fill.getStrokeWidth() / 2, fill);
+            fill.setStyle(Paint.Style.FILL);
+            speaker(cv, c, c - R * 0.12f, R * 0.42f);
+            text.setColor(0xE0FFFFFF);
+            text.setTextSize(Math.max(8f, R * 0.30f));
+            cv.drawText("HORN", c, c + R * 0.66f, text);
         }
 
         void draw2(Canvas cv) {
@@ -1372,26 +1674,36 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             cv.drawCircle(c, c, R, fill);
             fill.setStyle(Paint.Style.STROKE);
             fill.setStrokeWidth(Math.max(2f, R * 0.025f));
-            fill.setColor(moving ? 0xFFFF8A1E : 0x664A6390);
+            fill.setColor(edit ? 0xFFFF8A1E : 0x664A6390);
             cv.drawCircle(c, c, R - fill.getStrokeWidth() / 2, fill);
             fill.setStyle(Paint.Style.FILL);
-            // sides: dot + name
+            // sides: dot + name (settings: + / OK / - / HIDE)
             float edge = R * 0.16f;
             float dr = Math.max(3f, R / 16f);
-            text.setTextSize(Math.max(9f, R * 0.115f));
             for (int k = 1; k <= 4; k++) {
                 float px = c, py = c;
                 if (k == 1) py = c - R + edge;
                 else if (k == 2) px = c + R - edge;
                 else if (k == 3) py = c + R - edge;
                 else px = c - R + edge;
+                if (edit) {
+                    boolean hot = k == editAct;
+                    float bx = c, by = c, off = R * 0.62f;
+                    if (k == 1) by = c - off;
+                    else if (k == 2) bx = c + off;
+                    else if (k == 3) by = c + off;
+                    else bx = c - off;
+                    fill.setColor(hot ? 0xFFFF8A1E : 0x88FF8A1E);
+                    cv.drawCircle(bx, by, R * 0.26f, fill);
+                    text.setColor(0xFFFFFFFF);
+                    text.setTextSize(Math.max(9f, R * (k == 1 || k == 3 ? 0.26f : 0.13f)));
+                    cv.drawText(EDIT_LABEL[k], bx, by + text.getTextSize() * 0.36f, text);
+                    continue;
+                }
+                text.setTextSize(Math.max(9f, R * 0.115f));
                 boolean ok = mixer.has(k);
                 boolean on = (k == dir);
                 int col = on ? 0xFF2EA8FF : (ok ? 0xFF8FA2C4 : 0xFF4A5468);
-                if (moving) {
-                    arrow(cv, px, py, dr * 2.6f, k, 0xFFFF8A1E);
-                    continue;
-                }
                 fill.setColor(col);
                 cv.drawCircle(px, py, dr, fill);
                 text.setColor(on ? 0xFFFFFFFF : (ok ? 0xC8A9B8D2 : 0x80707A90));
@@ -1416,13 +1728,13 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             float x = c + kx, y = c + ky;
             fill.setColor(0x33000000);
             cv.drawCircle(x, y + rk * 0.08f, rk * 1.04f, fill);
-            fill.setColor(moving ? 0xFFFF8A1E : (dir != 0 ? 0xFF2EA8FF : 0xFF2C3D5E));
+            fill.setColor(edit ? 0xFFFF8A1E : (dir != 0 ? 0xFF2EA8FF : 0xFF2C3D5E));
             cv.drawCircle(x, y, rk, fill);
             fill.setColor(0x26FFFFFF);
             cv.drawCircle(x, y - rk * 0.25f, rk * 0.62f, fill);
-            if (moving) {
+            if (edit) {
                 text.setColor(0xFFFFFFFF);
-                text.setTextSize(Math.max(9f, rk * 0.42f));
+                text.setTextSize(Math.max(9f, rk * 0.40f));
                 cv.drawText("MOVE", x, y + text.getTextSize() * 0.35f, text);
             } else {
                 speaker(cv, x, y, rk * 0.55f);
