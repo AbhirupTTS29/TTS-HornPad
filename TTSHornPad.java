@@ -53,6 +53,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
     static Context app;
     static final Mixer mixer = new Mixer();
     static final Watcher watcher = new Watcher();
+    static final Weather weather = new Weather();
 
     // ---------------------------------------------------------------- provider plumbing
     @Override
@@ -92,6 +93,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 if (last != null) pad.setState(last);     // the HUD said its state before this pad existed
             }
             watcher.start(a);
+            weather.setPaused(false);
         } catch (Throwable t) {
             log("attach: " + t);
         }
@@ -102,6 +104,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         try {
             if (a == owner) {
                 mixer.stopAll();
+                weather.setPaused(true);
                 if (pad != null) pad.dropTouch();
             }
         } catch (Throwable t) {
@@ -114,6 +117,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         try {
             if (a == owner) {
                 mixer.stopAll();
+                weather.setRain(0);
                 owner = null;
                 pad = null;
             }
@@ -220,6 +224,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             while (end > 0 && buf[end - 1] != '\n') end--;   // whole lines only
             pos += end;
             String s = new String(buf, 0, end, "ISO-8859-1");
+            weatherFromLog(s);
             int i = s.lastIndexOf("TTSJOY: o");
             // the driver session ended (back to the menu, Surveyor / edit session): the game's script
             // router shuts down and the HUD script never gets to write "off" - hide the pad ourselves
@@ -238,6 +243,20 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             if (line.equals(lastLine)) return;
             lastLine = line;
             apply(parse(line));
+        }
+
+        /** rain level from the TTS weather commands of the HUD script ("TTSCMD:rain=N"); session end = dry */
+        static void weatherFromLog(String s) {
+            int r = s.lastIndexOf("TTSCMD:rain=");
+            int done = s.lastIndexOf("GSRouter::Done()");
+            if (done > r) {
+                weather.setRain(0);
+                return;
+            }
+            if (r >= 0 && r + 12 < s.length()) {
+                char c = s.charAt(r + 12);
+                if (c >= '0' && c <= '9') weather.setRain(c - '0');
+            }
         }
 
         static State parse(String line) {
@@ -872,6 +891,207 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 o.pos = next;
                 if (o.held && o.pos >= s.loopB) o.pos = s.loopA + s.xf;
             }
+        }
+    }
+
+    // ================================================================ rain + thunder sound
+    /**
+     * Rain and thunder, made here (no sound files needed).  Rain = several layers of filtered noise (the wash of
+     * the rain, the hiss near by) plus single drops; thunder = a crack and a long low rolling rumble, now and then
+     * while it storms.  Levels follow the TTS weather of the driver session (TTSCMD:rain=N from the HUD script):
+     *   0 dry, 1 rain, 2 heavy rain, 3 thunderstorm, 4 drizzle.
+     */
+    static final class Weather implements Runnable {
+        volatile int rain;
+        volatile boolean paused;
+        Thread th;
+        AudioTrack track;
+        final java.util.Random rnd = new java.util.Random();
+        float level = 0f;                     // smoothed rain level 0..1
+        // noise filter state (stereo)
+        float b0L, b1L, b2L, b0R, b1R, b2R, lpL, lpR, hpL, hpR, hpXL, hpXR;
+        // drops
+        float dropEnv, dropPan, dropF, dropPh;
+        // thunder
+        short[] thunder;                      // prepared rumble (mono)
+        int thPos = -1;
+        float thGain = 0f;
+        long nextThunder = 0;
+
+        synchronized void setRain(int r) {
+            if (r < 0 || r > 9) r = 0;
+            if (r != rain) TTSHornPad.log("weather: rain " + rain + " -> " + r);
+            rain = r;
+            if (r > 0 && (th == null || !th.isAlive())) {
+                th = new Thread(this, "TTSWeather");
+                th.setDaemon(true);
+                th.start();
+            }
+            notifyAll();
+        }
+
+        synchronized void setPaused(boolean p) {
+            paused = p;
+            notifyAll();
+        }
+
+        static float target(int r) {
+            switch (r) {
+                case 1: return 0.45f;
+                case 2: return 0.80f;
+                case 3: return 1.00f;
+                case 4: return 0.20f;
+                default: return 0f;
+            }
+        }
+
+        public void run() {
+            try {
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
+            } catch (Throwable t) {
+                // keep
+            }
+            final int chunk = 512;
+            short[] out = new short[chunk * 2];
+            while (true) {
+                try {
+                    synchronized (this) {
+                        while (paused || (rain == 0 && level < 0.002f && thPos < 0)) {
+                            if (track != null) {
+                                try {
+                                    track.pause();
+                                    track.flush();
+                                } catch (Throwable t) {
+                                    // ignore
+                                }
+                            }
+                            wait();
+                        }
+                    }
+                    render(out, chunk);
+                    if (track == null) track = Mixer.newTrack();
+                    if (track == null) {
+                        Thread.sleep(500);
+                        continue;
+                    }
+                    if (track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING) track.play();
+                    track.write(out, 0, out.length);
+                } catch (Throwable t) {
+                    TTSHornPad.log("weather audio: " + t);
+                    try {
+                        if (track != null) track.release();
+                    } catch (Throwable t2) {
+                        // ignore
+                    }
+                    track = null;
+                    try {
+                        Thread.sleep(500);
+                    } catch (InterruptedException e) {
+                        return;
+                    }
+                }
+            }
+        }
+
+        /** fills chunk stereo frames */
+        void render(short[] out, int chunk) {
+            int r = rain;
+            float tgt = target(r);
+            boolean storm = r == 3;
+            long now = System.currentTimeMillis();
+            if (storm && thPos < 0 && now > nextThunder) {
+                if (nextThunder != 0) {
+                    float dist = rnd.nextFloat();                 // 0 = right overhead, 1 = far away
+                    thunder = makeThunder(dist, rnd.nextLong());
+                    thPos = 0;
+                    thGain = 0.75f - 0.4f * dist;
+                }
+                nextThunder = now + 12000 + rnd.nextInt(26000);
+            }
+            if (!storm && thPos < 0) nextThunder = 0;
+            for (int i = 0; i < chunk; i++) {
+                level += (tgt - level) * (1f / (RATE * 2.5f));      // rain swells / dies away over a few seconds
+                float wL = rnd.nextFloat() * 2f - 1f, wR = rnd.nextFloat() * 2f - 1f;
+                // pink-ish noise (Paul Kellet, economy)
+                b0L = 0.99765f * b0L + wL * 0.0990460f; b1L = 0.96300f * b1L + wL * 0.2965164f; b2L = 0.57000f * b2L + wL * 1.0526913f;
+                b0R = 0.99765f * b0R + wR * 0.0990460f; b1R = 0.96300f * b1R + wR * 0.2965164f; b2R = 0.57000f * b2R + wR * 1.0526913f;
+                float pL = (b0L + b1L + b2L + wL * 0.1848f) * 0.11f, pR = (b0R + b1R + b2R + wR * 0.1848f) * 0.11f;
+                // wash (low-passed) + hiss (high-passed white)
+                lpL += (pL - lpL) * 0.18f; lpR += (pR - lpR) * 0.18f;
+                hpL = 0.92f * (hpL + wL - hpXL); hpXL = wL; hpR = 0.92f * (hpR + wR - hpXR); hpXR = wR;
+                float L = lpL * 0.9f + hpL * 0.10f, R = lpR * 0.9f + hpR * 0.10f;
+                // single drops: short decaying pings, more of them in heavy rain
+                if (dropEnv < 0.01f && rnd.nextFloat() < 0.0009f * (0.3f + level * 3f)) {
+                    dropEnv = 0.25f + rnd.nextFloat() * 0.5f;
+                    dropPan = rnd.nextFloat();
+                    dropF = (1800f + rnd.nextFloat() * 3500f) * 6.2831853f / RATE;
+                    dropPh = 0f;
+                }
+                if (dropEnv >= 0.01f) {
+                    dropPh += dropF;
+                    float d = (float) Math.sin(dropPh) * dropEnv * 0.25f;
+                    L += d * (1f - dropPan);
+                    R += d * dropPan;
+                    dropEnv *= 0.9965f;
+                }
+                float g = level * 0.8f;
+                L *= g;
+                R *= g;
+                if (thPos >= 0) {
+                    if (thPos < thunder.length) {
+                        float t = thunder[thPos++] / 32768f * thGain;
+                        L += t;
+                        R += t;
+                    } else thPos = -1;
+                }
+                // soft limit (a loud thunder clap must not crackle)
+                L = L / (1f + Math.abs(L) * 0.5f) * 1.25f;
+                R = R / (1f + Math.abs(R) * 0.5f) * 1.25f;
+                out[2 * i] = clip(L);
+                out[2 * i + 1] = clip(R);
+            }
+        }
+
+        /** thunder: crack (close strikes) + low rolling rumble with a few swells, 5..9 s, mono 44.1 kHz */
+        static short[] makeThunder(float dist, long seed) {
+            java.util.Random q = new java.util.Random(seed);
+            float len = 5f + 4f * q.nextFloat();
+            int n = (int) (RATE * len);
+            short[] s = new short[n];
+            float lp1 = 0f, lp2 = 0f, lp3 = 0f;
+            float cut = 0.020f + 0.03f * (1f - dist);              // farther = darker
+            int swells = 2 + q.nextInt(4);
+            float[] at = new float[swells], amp = new float[swells], wid = new float[swells];
+            for (int k = 0; k < swells; k++) {
+                at[k] = 0.15f + q.nextFloat() * (len * 0.55f);
+                amp[k] = 0.45f + q.nextFloat() * 0.55f;
+                wid[k] = 0.5f + q.nextFloat() * 1.4f;
+            }
+            float crack = dist < 0.35f ? (0.35f - dist) / 0.35f : 0f;
+            float delay = 0.05f + dist * 0.6f;                      // light first, sound later
+            for (int i = 0; i < n; i++) {
+                float t = i / (float) RATE - delay;
+                float w = q.nextFloat() * 2f - 1f;
+                lp1 += (w - lp1) * cut;
+                lp2 += (lp1 - lp2) * cut;
+                lp3 += (lp2 - lp3) * 0.5f;
+                float env = 0f;
+                if (t > 0f) {
+                    for (int k = 0; k < swells; k++) {
+                        float x = (t - at[k]) / wid[k];
+                        env += amp[k] * (x < 0f ? (float) Math.exp(-x * x * 18f) : (float) Math.exp(-x * 1.6f));
+                    }
+                    env *= Math.min(1f, t / 0.08f);
+                }
+                float v = lp3 * 9f * env;
+                if (crack > 0f && t > 0f && t < 0.35f) v += w * crack * (float) Math.exp(-t * 14f) * 0.8f;
+                float tail = Math.min(1f, (n - i) / (RATE * 0.8f));     // no click at the end
+                v *= tail;
+                if (v > 1f) v = 1f;
+                if (v < -1f) v = -1f;
+                s[i] = (short) (v * 30000f);
+            }
+            return s;
         }
     }
 
