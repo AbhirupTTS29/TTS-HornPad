@@ -297,7 +297,12 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             try {
                 float d = Integer.parseInt(s.substring(p, e));
                 int q = s.indexOf("in=", e);
-                boolean in = q >= 0 && q < e + 8 && q + 3 < s.length() && s.charAt(q + 3) == '1';
+                int in = 0;
+                if (q >= 0 && q < e + 8 && q + 3 < s.length()) {
+                    char ic = s.charAt(q + 3);
+                    if (ic == '1') in = 1;
+                    else if (ic == '2') in = 2;
+                }
                 camIn = in;
                 camD = d;
                 int vq = s.indexOf(" v=", e);
@@ -529,7 +534,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
     static final int RATE = 44100;
     // r119: listener place for the horn pad (from TTSCAM lines); camD < 0 = not known yet (plain sound)
     static volatile float camD = -1f;
-    static volatile boolean camIn;
+    static volatile int camIn;             // r123: 0 outside, 1 loco cab, 2 inside a coach (d = real distance)
     static volatile float camV;
     // r120c: straight pass model from the HUD (along-track offset S, passing distance B, relative speed U)
     static volatile float passS, passB, passU;
@@ -552,6 +557,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         float corr = 1f;   // how well the seam matches (1 = same waveform)
         float seamGain = 1f;
         boolean tailOk;    // what follows the loop body really dies away (horn release), not more of the sound
+        float norm = 1f;   // r123: brings the steady body to the same loudness for every horn file
     }
 
     static Snd readWav(File f) {
@@ -619,6 +625,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 s.pcm[2 * i + 1] = clip(R[a] + (R[c] - R[a]) * t);
             }
             findLoop(s);
+            loudness(s);
             return s;
         } catch (Throwable t) {
             log("wav " + f + ": " + t);
@@ -633,6 +640,29 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
      * start best, the seam is cross-faded (up to 150 ms, equal power when the two parts do not match).
      * What follows the window is the sound's own release; it plays when the finger lets go.
      */
+    /**
+     * r123: horn files come in at any level (many are cut to full scale - with the ground bounce and the old
+     * hard clip that "cracked" the phone speaker).  The steady body is brought to -15 dBFS RMS (at most +6 dB
+     * up, any amount down); the limiter at the output keeps every peak under -1 dBFS.
+     */
+    static void loudness(Snd s) {
+        int a = Math.max(0, s.loopA), b = Math.min(s.frames, s.loopB);
+        if (b - a < RATE / 20) {
+            a = 0;
+            b = s.frames;
+        }
+        double e = 0;
+        for (int i = a; i < b; i++) {
+            float l = s.pcm[2 * i], r = s.pcm[2 * i + 1];
+            e += 0.5 * (l * l + r * r);
+        }
+        double rms = Math.sqrt(e / Math.max(1, b - a)) / 32768.0;
+        if (rms < 1e-5) return;
+        float g = (float) (0.178 / rms);
+        if (g > 2f) g = 2f;
+        s.norm = g;
+    }
+
     static void findLoop(Snd s) {
         int win = RATE / 100;                      // 10 ms blocks
         int nb = s.frames / win;
@@ -838,7 +868,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         float vCur;
 
         double travelFrames() {
-            if (camIn || gd < 0f) return 0;
+            if (camIn == 1 || gd < 0f) return 0;
             return Math.min(3.0, gd / 343.0) * RATE;
         }
 
@@ -894,7 +924,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
 
         void ground(float[] acc, int chunk) {
             float d = gd, delT = 0f, ampT = 0f;
-            if (!camIn && d >= 0f) {
+            if (camIn == 0 && d >= 0f) {
                 d = Math.max(d, 2f);
                 float hs = 4.2f, hl = 1.7f;
                 float direct = (float) Math.sqrt(d * d + (hs - hl) * (hs - hl));
@@ -911,11 +941,18 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 gBuf[2 * gPos + 1] = acc[2 * k + 1];
                 float rp = gPos - gDel;
                 if (rp < 0) rp += n;
+                // r123: gPos - (tiny delay) + n rounds to n in float: index n -> ArrayIndexOutOfBounds killed the
+                // audio thread (stopAll) - the horn stopped dead when the camera went into the cab
                 int a = (int) rp;
-                float f = rp - a;
-                int b = a + 1 == n ? 0 : a + 1;
-                acc[2 * k] += gAmp * (gBuf[2 * a] * (1f - f) + gBuf[2 * b] * f);
-                acc[2 * k + 1] += gAmp * (gBuf[2 * a + 1] * (1f - f) + gBuf[2 * b + 1] * f);
+                if (a >= n) a -= n;
+                if (a < 0) a = 0;
+                float f = rp - (int) rp;
+                if (f < 0f || f >= 1f) f = 0f;
+                int b = a + 1 >= n ? 0 : a + 1;
+                // r123: direct + bounce scaled so the average loudness stays the same (it added up to +3.8 dB)
+                float gn = 1f / (float) Math.sqrt(1f + gAmp * gAmp);
+                acc[2 * k] = (acc[2 * k] + gAmp * (gBuf[2 * a] * (1f - f) + gBuf[2 * b] * f)) * gn;
+                acc[2 * k + 1] = (acc[2 * k + 1] + gAmp * (gBuf[2 * a + 1] * (1f - f) + gBuf[2 * b + 1] * f)) * gn;
                 gPos = gPos + 1 == n ? 0 : gPos + 1;
             }
         }
@@ -1051,7 +1088,8 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                     doppler(acc, chunk);
                     ground(acc, chunk);
                     hear(acc, chunk);
-                    for (int i = 0; i < out.length; i++) out[i] = clip(acc[i] * 0.9f);
+                    limit(acc, chunk);
+                    for (int i = 0; i < out.length; i++) out[i] = clip(acc[i]);
                     if (track == null) track = newTrack();
                     if (track == null) {
                         stopAll();
@@ -1097,7 +1135,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             float u = passU;
             // r121: below 6 m/s (22 km/h) the "speed" is only camera / position jitter (his r120 log:
             // standing train, U 0.5..4 m/s with S jumping +-3 m) - that bent the horn pitch up and down
-            if (camIn || camD < 0f || u < 6f) return;
+            if (camIn != 0 || camD < 0f || u < 6f) return;
             float age = (System.nanoTime() - passT) * 1e-9f;
             if (age < 0f || age > 2.5f) return;
             float s = passS + u * age, b = passB;
@@ -1108,18 +1146,55 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             gface = -s / d;
         }
 
+        /**
+         * r123: peak limiter (no more hard clipping = no "cracking" in the phone speaker).  Ceiling -3 dBFS,
+         * the gain falls at once when a peak comes and recovers in 0.25 s; a soft knee above -4.4 dBFS.
+         */
+        float limEnv = 0f;
+
+        void limit(float[] acc, int chunk) {
+            final float ceil = 0.71f;          // -3 dBFS: room for the game's own sound in the phone's mixer
+            final float rel = (float) Math.exp(-1.0 / (RATE * 0.25));
+            for (int i = 0; i < chunk; i++) {
+                float l = acc[2 * i], r = acc[2 * i + 1];
+                float pk = Math.max(Math.abs(l), Math.abs(r));
+                limEnv = pk > limEnv ? pk : limEnv * rel + pk * (1f - rel);
+                float g = limEnv > ceil ? ceil / limEnv : 1f;
+                acc[2 * i] = soft(l * g);
+                acc[2 * i + 1] = soft(r * g);
+            }
+        }
+
+        static float soft(float x) {
+            float a = Math.abs(x);
+            if (a <= 0.6f) return x;
+            float y = 0.6f + 0.15f * (float) Math.tanh((a - 0.6f) / 0.15f);
+            return x < 0 ? -y : y;
+        }
+
         void hear(float[] acc, int chunk) {
             float d = gd, gT, fc;
+            int in = camIn;
             if (d < 0f) {
-                gT = 1f;
+                gT = 0.85f;
                 fc = 20000f;
-            } else if (camIn) {
-                gT = 0.6f;
-                fc = 2600f;
+            } else if (in == 1) {
+                // r123: in the loco cab the horn sits on the roof just above - loud, the roof only takes a
+                // little of the top off (r119 had -4.4 dB and 2.6 kHz: the horn vanished under the cab noise)
+                gT = 0.9f;
+                fc = 7000f;
+            } else if (in == 2) {
+                // r123: inside a coach: the real distance to the loco and the coach body in between
+                // (about -5 dB, the highs stay outside)
+                d = Math.max(d, 8f);
+                gT = 0.55f * Math.min(1f, 8f / (8f + 0.156f * (d - 8f)));
+                fc = Math.min(3200f, Math.max(1800f, 18000f / (1f + d / 300f)));
             } else {
                 d = Math.max(d, 1f);
-                gT = Math.min(1f, HORN_REF / d);
-                fc = Math.max(900f, 18000f / (1f + d / 120f));
+                // r122: Open Rails distance law (reference 8 m, gain 0.025 at 2 km) like the engine sounds -
+                // a horn carries far: 100 m = -7 dB, 500 m = -21 dB (1/r was -18 / -32 dB: "too quiet")
+                gT = Math.min(1f, 8f / (8f + 0.156f * (d - 8f)));
+                fc = Math.max(2500f, 18000f / (1f + d / 300f));
                 // (r120d: no front/back difference - his real pass-by recordings keep the horn just as loud
                 // and clear after the loco has gone past; only the pitch drops)
             }
@@ -1185,7 +1260,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                     next = o.tailPos + o.tailN;          // the cross-fade is over: carry on in the ending
                     o.tailPos = -1;
                 }
-                float g = o.gain * o.fade / 32768f;
+                float g = o.gain * o.fade * s.norm / 32768f;
                 acc[2 * i] += l * g;
                 acc[2 * i + 1] += r * g;
                 if (o.fadeMul < 1f) {
