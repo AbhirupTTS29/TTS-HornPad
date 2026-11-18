@@ -43,7 +43,8 @@ import java.util.Locale;
  * Drag the knob towards a side and hold: up = horn.wav, right = extra.wav, down = idle 1.wav (bell),
  * left = sander1.wav.  The sound loops while the finger stays there and finishes naturally when it is
  * released.  The files come from the horn asset of the driven loco, which the HUD script writes to
- * Trainz.log ("TTSJOY: on <kuid:..> x= y= d=" / "TTSJOY: off").  Long-press the knob = settings:
+ * Trainz.log ("TTSJOY: on <kuid:..> x= y= d=" / "TTSJOY: off").  r118: the small gear at the top-right of
+ * the pad (or a long-press on the knob) = settings:
  * move, bigger / smaller, hide (small HORN button) - all remembered.  r117: the pad's finger is taken out
  * of the game's touches only, so camera and other controls keep working while the horn is held.
  *
@@ -137,6 +138,19 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
     static void log(String s) {
         try {
             android.util.Log.i("TTSHornPad", s);
+        } catch (Throwable t) {
+            // nothing
+        }
+        // r118: also a small file he can send: Android/media/com.n3vgames.android.trainz/TTSHornPad.log
+        try {
+            File f = new File("/sdcard/Android/media/com.n3vgames.android.trainz/TTSHornPad.log");
+            boolean append = f.length() < 256 * 1024;
+            java.io.FileOutputStream o = new java.io.FileOutputStream(f, append);
+            try {
+                o.write((System.currentTimeMillis() + " " + s + "\n").getBytes("UTF-8"));
+            } finally {
+                o.close();
+            }
         } catch (Throwable t) {
             // nothing
         }
@@ -1167,6 +1181,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 routedFor = a;
                 return;
             }
+            log("router: window callback " + cb.getClass().getName());
             Router r = new Router(cb);
             Window.Callback p = (Window.Callback) Proxy.newProxyInstance(TTSHornPad.class.getClassLoader(),
                     new Class<?>[]{Window.Callback.class}, r);
@@ -1317,6 +1332,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         boolean editDrag;              // settings: the pad follows the finger
         int editAct;                   // settings: side touched (tap on release)
         boolean miniTap, miniDrag;
+        boolean gearTap;               // r118: the small gear button at the top-right corner
         float downX, downY;
         int startLeft, startTop;
         final Runnable longPress = new Runnable() {
@@ -1324,6 +1340,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 if (held && dir == 0 && !edit && !hidden) {
                     edit = true;
                     editDrag = true;
+                    log("settings open (long-press)");
                     kx = 0;
                     ky = 0;
                     performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
@@ -1439,6 +1456,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             editAct = 0;
             miniTap = false;
             miniDrag = false;
+            gearTap = false;
             post(spring);
         }
 
@@ -1464,7 +1482,13 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             getLocationInWindow(loc);
             float c = getWidth() / 2f, R = c - 2;
             float dx = wx - loc[0] - c, dy = wy - loc[1] - c;
-            if (dx * dx + dy * dy > R * R) return false;          // outside the circle: the game gets it
+            boolean gear = false;
+            if (!hidden) {
+                float g = getWidth() * 0.11f;
+                float gx = wx - loc[0] - (getWidth() - g), gy = wy - loc[1] - g;
+                gear = gx * gx + gy * gy < g * g * 2.0f;
+            }
+            if (!gear && dx * dx + dy * dy > R * R) return false;   // outside the circle: the game gets it
             held = true;
             downX = wx;
             downY = wy;
@@ -1476,6 +1500,12 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             if (hidden) {
                 miniTap = true;
                 miniDrag = false;
+                invalidate();
+                return true;
+            }
+            if (gear) {
+                gearTap = true;
+                log("gear down");
                 invalidate();
                 return true;
             }
@@ -1499,6 +1529,10 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             if (!held) return;
             float mx = wx - downX, my = wy - downY;
             float far = mx * mx + my * my;
+            if (gearTap) {
+                if (far > 40 * 40) gearTap = false;
+                return;
+            }
             if (hidden) {
                 if (far > 22 * 22) {
                     miniTap = false;
@@ -1525,6 +1559,21 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             if (!held) return;
             held = false;
             removeCallbacks(longPress);
+            if (gearTap) {
+                gearTap = false;
+                if (!cancel) {
+                    edit = !edit;
+                    log("settings " + (edit ? "open" : "closed"));
+                    if (dir != 0) mixer.release(dir);
+                    dir = 0;
+                    kx = 0;
+                    ky = 0;
+                    performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+                    if (edit) postDelayed(editEnd, 12000);
+                }
+                invalidate();
+                return;
+            }
             if (hidden) {
                 if (miniDrag) savePlace();
                 else if (miniTap && !cancel) setHidden(false);
@@ -1739,6 +1788,32 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             } else {
                 speaker(cv, x, y, rk * 0.55f);
             }
+            gear(cv);
+        }
+
+        /** r118: settings button in the free top-right corner of the pad's square */
+        void gear(Canvas cv) {
+            float w = getWidth();
+            float g = w * 0.11f;
+            float gx = w - g, gy = g, r = g * 0.82f;
+            fill.setStyle(Paint.Style.FILL);
+            fill.setColor(edit || gearTap ? 0xFFFF8A1E : 0xD80B1322);
+            cv.drawCircle(gx, gy, r, fill);
+            fill.setStyle(Paint.Style.STROKE);
+            fill.setStrokeWidth(Math.max(1.5f, r * 0.10f));
+            fill.setColor(edit ? 0xFFFFFFFF : 0xCCFF8A1E);
+            cv.drawCircle(gx, gy, r * 0.97f, fill);
+            fill.setColor(0xFFFFFFFF);
+            fill.setStrokeWidth(Math.max(2f, r * 0.20f));
+            fill.setStrokeCap(Paint.Cap.ROUND);
+            for (int i = 0; i < 8; i++) {
+                double a = i * Math.PI / 4;
+                float ca = (float) Math.cos(a), sa = (float) Math.sin(a);
+                cv.drawLine(gx + ca * r * 0.38f, gy + sa * r * 0.38f, gx + ca * r * 0.62f, gy + sa * r * 0.62f, fill);
+            }
+            fill.setStrokeWidth(Math.max(1.5f, r * 0.14f));
+            cv.drawCircle(gx, gy, r * 0.33f, fill);
+            fill.setStyle(Paint.Style.FILL);
         }
 
         void speaker(Canvas cv, float x, float y, float s) {
