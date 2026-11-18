@@ -44,7 +44,8 @@ import java.util.Locale;
  * left = sander1.wav.  The sound loops while the finger stays there and finishes naturally when it is
  * released.  The files come from the horn asset of the driven loco, which the HUD script writes to
  * Trainz.log ("TTSJOY: on <kuid:..> x= y= d=" / "TTSJOY: off").  r118: the small gear at the top-right of
- * the pad (or a long-press on the knob) = settings:
+ * the pad (or a long-press on the knob) = settings:  r119: the horn is heard from where the camera is
+ * (TTSCAM: 1/r loudness, air low-pass, muffled in the cab).
  * move, bigger / smaller, hide (small HORN button) - all remembered.  r117: the pad's finger is taken out
  * of the game's touches only, so camera and other controls keep working while the horn is held.
  *
@@ -247,6 +248,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             pos += end;
             String s = new String(buf, 0, end, "ISO-8859-1");
             weatherFromLog(s);
+            camFromLog(s);
             int i = s.lastIndexOf("TTSJOY: o");
             // the driver session ended (back to the menu, Surveyor / edit session): the game's script
             // router shuts down and the HUD script never gets to write "off" - hide the pad ourselves
@@ -265,6 +267,32 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             if (line.equals(lastLine)) return;
             lastLine = line;
             apply(parse(line));
+        }
+
+        /**
+         * r119: where the camera is ("TTSCAM: d=<metres> in=<0|1>" from the HUD script): the horn pad plays
+         * the horn like it is heard there - quieter and duller far away, muffled inside the cab.
+         */
+        static void camFromLog(String s) {
+            int c = s.lastIndexOf("TTSCAM: d=");
+            int done = s.lastIndexOf("GSRouter::Done()");
+            if (done > c) {
+                if (done >= 0) camD = -1f;
+                return;
+            }
+            if (c < 0) return;
+            int p = c + 10, e = p;
+            while (e < s.length() && s.charAt(e) >= '0' && s.charAt(e) <= '9') e++;
+            if (e == p) return;
+            try {
+                float d = Integer.parseInt(s.substring(p, e));
+                int q = s.indexOf("in=", e);
+                boolean in = q >= 0 && q < e + 8 && q + 3 < s.length() && s.charAt(q + 3) == '1';
+                camIn = in;
+                camD = d;
+            } catch (NumberFormatException x) {
+                // keep
+            }
         }
 
         /** rain level from the TTS weather commands of the HUD script ("TTSCMD:rain=N"); session end = dry */
@@ -459,6 +487,10 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
 
     // ================================================================ sounds
     static final int RATE = 44100;
+    // r119: listener place for the horn pad (from TTSCAM lines); camD < 0 = not known yet (plain sound)
+    static volatile float camD = -1f;
+    static volatile boolean camIn;
+    static final float HORN_REF = 12f;     // full loudness up to 12 m, then 1/r (-6 dB per doubling)
     static final String[][] NAMES = {
         {},
         {"horn.wav"},                                         // 1 up
@@ -724,6 +756,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         AudioTrack track;
         Thread th;
         final Object lock = new Object();
+        float gCur = 1f, aCur = 1f, lpL, lpR;     // r119: distance gain / air low-pass state
 
         void load(File dir) {
             Snd[] n = new Snd[5];
@@ -853,6 +886,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                             if (o.done) v[k] = null;
                         }
                     }
+                    hear(acc, chunk);
                     for (int i = 0; i < out.length; i++) out[i] = clip(acc[i] * 0.9f);
                     if (track == null) track = newTrack();
                     if (track == null) {
@@ -877,6 +911,37 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                         return;
                     }
                 }
+            }
+        }
+
+        /**
+         * r119: the horn as heard where the camera is.  Outside: 1/r loudness from 12 m (100 m = -18 dB,
+         * 500 m = -32 dB) and air taking the highs away (low-pass 18 kHz near, ~10 kHz at 100 m, ~3.5 kHz at
+         * 500 m).  In the cab: through the cab body - lower and muffled (2.6 kHz).  Changes glide (0.12 s).
+         */
+        void hear(float[] acc, int chunk) {
+            float d = camD, gT, fc;
+            if (d < 0f) {
+                gT = 1f;
+                fc = 20000f;
+            } else if (camIn) {
+                gT = 0.6f;
+                fc = 2600f;
+            } else {
+                d = Math.max(d, 1f);
+                gT = Math.min(1f, HORN_REF / d);
+                fc = Math.max(900f, 18000f / (1f + d / 120f));
+            }
+            float aT = (float) (1.0 - Math.exp(-2.0 * Math.PI * Math.min(fc, RATE * 0.45f) / RATE));
+            if (d < 0f) aT = 1f;
+            float sm = (float) (1.0 - Math.exp(-1.0 / (RATE * 0.12)));
+            for (int i = 0; i < chunk; i++) {
+                gCur += (gT - gCur) * sm;
+                aCur += (aT - aCur) * sm;
+                lpL += aCur * (acc[2 * i] - lpL);
+                lpR += aCur * (acc[2 * i + 1] - lpR);
+                acc[2 * i] = lpL * gCur;
+                acc[2 * i + 1] = lpR * gCur;
             }
         }
 
