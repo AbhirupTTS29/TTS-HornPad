@@ -227,11 +227,18 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             File f = findLog();
             if (f == null) return;
             if (!f.equals(logFile)) {
+                pos = logFile == null ? -1 : 0;            // r120: another log file appearing later is new
                 logFile = f;
-                pos = -1;
             }
             long len = f.length();
-            if (pos < 0 || len < pos) pos = Math.max(0, len - (1 << 20));   // new log: look at its last 1 MB
+            // r120: what is already in the log when the game starts belongs to the LAST run (a driver
+            // session that was never closed left "TTSJOY: on" there and the pad showed on the menu):
+            // start at its end.  A log that got shorter is a new one: read it from the start.
+            if (pos < 0) {
+                pos = len;
+                return;
+            }
+            if (len < pos) pos = 0;
             if (len == pos) return;
             long n = Math.min(len - pos, 1 << 20);
             if (len - pos > n) pos = len - n;
@@ -277,7 +284,10 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             int c = s.lastIndexOf("TTSCAM: d=");
             int done = s.lastIndexOf("GSRouter::Done()");
             if (done > c) {
-                if (done >= 0) camD = -1f;
+                if (done >= 0) {
+                    camD = -1f;
+                    camV = 0f;
+                }
                 return;
             }
             if (c < 0) return;
@@ -290,9 +300,39 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 boolean in = q >= 0 && q < e + 8 && q + 3 < s.length() && s.charAt(q + 3) == '1';
                 camIn = in;
                 camD = d;
+                int vq = s.indexOf(" v=", e);
+                float vv = 0f;
+                if (vq >= 0 && vq < e + 16) {
+                    int a = vq + 3, b = a;
+                    if (b < s.length() && s.charAt(b) == '-') b++;
+                    while (b < s.length() && s.charAt(b) >= '0' && s.charAt(b) <= '9') b++;
+                    if (b > a && !(b == a + 1 && s.charAt(a) == '-')) vv = Integer.parseInt(s.substring(a, b));
+                }
+                camV = vv;
+                // r120c: pass geometry (decimetres): the pad follows the pass by itself between updates
+                int sq = s.indexOf(" S=", e), bq = s.indexOf(" B=", e), uq = s.indexOf(" U=", e);
+                int le = s.indexOf('\n', e);
+                if (le < 0) le = s.length();
+                if (sq > 0 && bq > 0 && uq > 0 && sq < le && bq < le && uq < le) {
+                    float ps = intAt(s, sq + 3) * 0.1f, pb = intAt(s, bq + 3) * 0.1f, pu = intAt(s, uq + 3) * 0.1f;
+                    passS = ps;
+                    passB = pb;
+                    passU = pu;
+                    passT = System.nanoTime() - 200000000L;     // ~0.2 s from the game to here
+                } else {
+                    passU = 0f;
+                }
             } catch (NumberFormatException x) {
                 // keep
             }
+        }
+
+        static int intAt(String s, int a) {
+            int b = a;
+            if (b < s.length() && s.charAt(b) == '-') b++;
+            while (b < s.length() && s.charAt(b) >= '0' && s.charAt(b) <= '9') b++;
+            if (b == a || (b == a + 1 && s.charAt(a) == '-')) return 0;
+            return Integer.parseInt(s.substring(a, b));
         }
 
         /** rain level from the TTS weather commands of the HUD script ("TTSCMD:rain=N"); session end = dry */
@@ -490,6 +530,10 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
     // r119: listener place for the horn pad (from TTSCAM lines); camD < 0 = not known yet (plain sound)
     static volatile float camD = -1f;
     static volatile boolean camIn;
+    static volatile float camV;
+    // r120c: straight pass model from the HUD (along-track offset S, passing distance B, relative speed U)
+    static volatile float passS, passB, passU;
+    static volatile long passT;            // r120: m/s the camera and the loco move apart (+) / closer (-)
     static final float HORN_REF = 12f;     // full loudness up to 12 m, then 1/r (-6 dB per doubling)
     static final String[][] NAMES = {
         {},
@@ -757,6 +801,124 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         Thread th;
         final Object lock = new Object();
         float gCur = 1f, aCur = 1f, lpL, lpR;     // r119: distance gain / air low-pass state
+        // r120: Doppler - the mixed horn is read back at speed p = c / (c + v), v = how fast the camera and
+        // the loco move apart (TTSCAM v=, m/s).  Coming closer = higher, going away = lower, like a real
+        // train passing while honking.  Linear-interpolated variable-rate read of the mix.
+        float[] inBuf = new float[2 * 2048];
+        float[] tmp = new float[2 * 64];
+        int inN;
+        double rpos;
+        float pCur = 1f;
+
+        /** adds 64 freshly mixed frames to inBuf; false = nothing is playing any more */
+        boolean mixMore() {
+            if (2 * (inN + 64) > inBuf.length) inN = 0;            // cannot happen (p < 1.4), stay safe
+            for (int i = 0; i < tmp.length; i++) tmp[i] = 0f;
+            synchronized (lock) {
+                if (!busy()) return false;
+                for (int k = 1; k <= 4; k++) {
+                    Voice o = v[k];
+                    if (o == null) continue;
+                    mix(o, tmp, 64);
+                    if (o.done) v[k] = null;
+                }
+            }
+            System.arraycopy(tmp, 0, inBuf, 2 * inN, tmp.length);
+            inN += 64;
+            return true;
+        }
+
+        /**
+         * r120b: the horn as a real moving source: read back through a moving-delay line.  The delay is the
+         * travel time d / c (343 m/s): the horn reaches you later the farther the loco is, and while the
+         * distance changes the read speed is 1 - v / c - the true retarded-time Doppler (a train coming
+         * at 108 km/h sounds ~9 % higher, after it passes ~9 % lower).  The speed glides (0.25 s) between the
+         * HUD's 5-per-second updates so the pitch sweeps smoothly instead of stepping.
+         */
+        float vCur;
+
+        double travelFrames() {
+            if (camIn || gd < 0f) return 0;
+            return Math.min(3.0, gd / 343.0) * RATE;
+        }
+
+        void doppler(float[] acc, int chunk) {
+            float vr = gv;
+            if (vr > 90f) vr = 90f;
+            if (vr < -90f) vr = -90f;
+            final float kv = 1f / (RATE * (passU >= 0.5f ? 0.03f : 0.25f));   // model: follow closely
+            for (int k = 0; k < chunk; k++) {
+                vCur += (vr - vCur) * kv;
+                pCur = 1f - vCur / 343f;
+                if (rpos < 0) {                                    // still on its way to the ear
+                    acc[2 * k] = 0f;
+                    acc[2 * k + 1] = 0f;
+                    rpos += pCur;
+                    continue;
+                }
+                int i0 = (int) rpos;
+                boolean over = false;
+                while (i0 + 1 >= inN) {
+                    if (!mixMore()) {
+                        over = true;
+                        break;
+                    }
+                }
+                if (over) {                                        // all played out: silence, let it rest
+                    acc[2 * k] = 0f;
+                    acc[2 * k + 1] = 0f;
+                    rpos = Math.max(rpos, inN);
+                    continue;
+                }
+                float f = (float) (rpos - i0);
+                acc[2 * k] = inBuf[2 * i0] * (1f - f) + inBuf[2 * i0 + 2] * f;
+                acc[2 * k + 1] = inBuf[2 * i0 + 1] * (1f - f) + inBuf[2 * i0 + 3] * f;
+                rpos += pCur;
+            }
+            int drop = (int) rpos;
+            if (drop > 0) {
+                System.arraycopy(inBuf, 2 * drop, inBuf, 0, 2 * (inN - drop));
+                inN -= drop;
+                rpos -= drop;
+            }
+        }
+
+        /**
+         * r120b: the second way a horn reaches you outdoors - bounced off the ground.  Horn on the loco roof
+         * (4.2 m), ear 1.7 m up: the bounce is a few ms later and the two mix into the moving "whoosh"
+         * (comb filter sliding through the sound) you hear when a train passes close.  Not in the cab.
+         */
+        final float[] gBuf = new float[2 * 4096];
+        int gPos;
+        float gDel, gAmp;
+
+        void ground(float[] acc, int chunk) {
+            float d = gd, delT = 0f, ampT = 0f;
+            if (!camIn && d >= 0f) {
+                d = Math.max(d, 2f);
+                float hs = 4.2f, hl = 1.7f;
+                float direct = (float) Math.sqrt(d * d + (hs - hl) * (hs - hl));
+                float bounce = (float) Math.sqrt(d * d + (hs + hl) * (hs + hl));
+                delT = Math.min(4000f, (bounce - direct) / 343f * RATE);
+                ampT = 0.55f * direct / bounce;
+            }
+            final float k1 = 1f / (RATE * 0.2f);
+            int n = gBuf.length / 2;
+            for (int k = 0; k < chunk; k++) {
+                gDel += (delT - gDel) * k1;
+                gAmp += (ampT - gAmp) * k1;
+                gBuf[2 * gPos] = acc[2 * k];
+                gBuf[2 * gPos + 1] = acc[2 * k + 1];
+                float rp = gPos - gDel;
+                if (rp < 0) rp += n;
+                int a = (int) rp;
+                float f = rp - a;
+                int b = a + 1 == n ? 0 : a + 1;
+                acc[2 * k] += gAmp * (gBuf[2 * a] * (1f - f) + gBuf[2 * b] * f);
+                acc[2 * k + 1] += gAmp * (gBuf[2 * a + 1] * (1f - f) + gBuf[2 * b + 1] * f);
+                gPos = gPos + 1 == n ? 0 : gPos + 1;
+            }
+        }
 
         void load(File dir) {
             Snd[] n = new Snd[5];
@@ -865,8 +1027,10 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             int idle = 0;
             while (true) {
                 try {
+                    boolean waited = false;
                     synchronized (lock) {
-                        while (!busy()) {
+                        // r120: keep going while delayed sound is still on its way (inBuf not played out)
+                        while (!busy() && inN - rpos < 2) {
                             if (track != null && idle > 0) {
                                 try {
                                     track.pause();
@@ -876,16 +1040,16 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                                 }
                                 idle = 0;
                             }
+                            inN = 0;
+                            rpos = 0;
+                            waited = true;
                             lock.wait();
                         }
-                        for (int i = 0; i < acc.length; i++) acc[i] = 0f;
-                        for (int k = 1; k <= 4; k++) {
-                            Voice o = v[k];
-                            if (o == null) continue;
-                            mix(o, acc, chunk);
-                            if (o.done) v[k] = null;
-                        }
                     }
+                    geom();
+                    if (waited) rpos = -travelFrames();         // the sound needs d / c to reach the ear
+                    doppler(acc, chunk);
+                    ground(acc, chunk);
                     hear(acc, chunk);
                     for (int i = 0; i < out.length; i++) out[i] = clip(acc[i] * 0.9f);
                     if (track == null) track = newTrack();
@@ -919,8 +1083,31 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
          * 500 m = -32 dB) and air taking the highs away (low-pass 18 kHz near, ~10 kHz at 100 m, ~3.5 kHz at
          * 500 m).  In the cab: through the cab body - lower and muffled (2.6 kHz).  Changes glide (0.12 s).
          */
+        /**
+         * r120c: where the loco is right now.  With a pass model from the HUD the distance, the speed toward /
+         * away and the side of the horn are worked out for every audio block (no 0.2 s steps):
+         *   s = S + U * t,  d = sqrt(B^2 + s^2),  v = U * s / d,  facing = -s / d (1 = in front of the horn).
+         */
+        float gd = -1f, gv, gface = 1f;
+
+        void geom() {
+            gd = camD;
+            gv = camIn || camD < 0f ? 0f : camV;
+            gface = 1f;
+            float u = passU;
+            if (camIn || camD < 0f || u < 0.5f) return;
+            float age = (System.nanoTime() - passT) * 1e-9f;
+            if (age < 0f || age > 2.5f) return;
+            float s = passS + u * age, b = passB;
+            float d = (float) Math.sqrt(b * b + s * s);
+            if (d < 1f) d = 1f;
+            gd = d;
+            gv = u * s / d;
+            gface = -s / d;
+        }
+
         void hear(float[] acc, int chunk) {
-            float d = camD, gT, fc;
+            float d = gd, gT, fc;
             if (d < 0f) {
                 gT = 1f;
                 fc = 20000f;
@@ -931,6 +1118,8 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 d = Math.max(d, 1f);
                 gT = Math.min(1f, HORN_REF / d);
                 fc = Math.max(900f, 18000f / (1f + d / 120f));
+                // (r120d: no front/back difference - his real pass-by recordings keep the horn just as loud
+                // and clear after the loco has gone past; only the pitch drops)
             }
             float aT = (float) (1.0 - Math.exp(-2.0 * Math.PI * Math.min(fc, RATE * 0.45f) / RATE));
             if (d < 0f) aT = 1f;
