@@ -846,7 +846,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             float vr = gv;
             if (vr > 90f) vr = 90f;
             if (vr < -90f) vr = -90f;
-            final float kv = 1f / (RATE * (passU >= 0.5f ? 0.03f : 0.25f));   // model: follow closely
+            final float kv = 1f / (RATE * 0.08f);
             for (int k = 0; k < chunk; k++) {
                 vCur += (vr - vCur) * kv;
                 pCur = 1f - vCur / 343f;
@@ -1092,10 +1092,12 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
 
         void geom() {
             gd = camD;
-            gv = camIn || camD < 0f ? 0f : camV;
+            gv = 0f;                       // r121: no pitch change unless a real pass is going on
             gface = 1f;
             float u = passU;
-            if (camIn || camD < 0f || u < 0.5f) return;
+            // r121: below 6 m/s (22 km/h) the "speed" is only camera / position jitter (his r120 log:
+            // standing train, U 0.5..4 m/s with S jumping +-3 m) - that bent the horn pitch up and down
+            if (camIn || camD < 0f || u < 6f) return;
             float age = (System.nanoTime() - passT) * 1e-9f;
             if (age < 0f || age > 2.5f) return;
             float s = passS + u * age, b = passB;
