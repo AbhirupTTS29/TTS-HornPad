@@ -221,6 +221,16 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             pos += end;
             String s = new String(buf, 0, end, "ISO-8859-1");
             int i = s.lastIndexOf("TTSJOY: o");
+            // the driver session ended (back to the menu, Surveyor / edit session): the game's script
+            // router shuts down and the HUD script never gets to write "off" - hide the pad ourselves
+            int done = Math.max(s.lastIndexOf("GSRouter::Done()"), s.lastIndexOf("TTSJOY: end"));
+            if (done > i) {
+                if (lastLine.length() > 0) {
+                    lastLine = "";
+                    apply(new State());
+                }
+                return;
+            }
             if (i < 0) return;
             int e = s.indexOf('\n', i);
             if (e < 0) e = s.length();
@@ -422,6 +432,8 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         int frames;
         int loopA, loopB;  // loop window (frames)
         int xf;            // cross-fade length (frames)
+        float corr = 1f;   // how well the seam matches (1 = same waveform)
+        float seamGain = 1f;
     }
 
     static Snd readWav(File f) {
@@ -497,78 +509,110 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
     }
 
     /**
-     * Loop window = the loud, steady part of the sound: around the loudest 20 ms block, as far as the
-     * level stays above 65 % of it (horn: the blast, not its fading tail).  Short or flat sounds: all of it.
+     * Loop window = the long steady body of the sound (horn: the blast, not its attack or its fading tail).
+     * Envelope in 10 ms blocks, smoothed over 100 ms.  The body is the longest run of blocks that stay within
+     * -4.5 dB of the level around the peak.  The end is moved (+-30 ms) to where the waveform matches the
+     * start best, the seam is cross-faded (up to 150 ms, equal power when the two parts do not match).
+     * What follows the window is the sound's own release; it plays when the finger lets go.
      */
     static void findLoop(Snd s) {
-        int win = RATE / 50;                       // 20 ms blocks
+        int win = RATE / 100;                      // 10 ms blocks
         int nb = s.frames / win;
         s.loopA = 0;
         s.loopB = s.frames;
         s.xf = Math.min(RATE * 30 / 1000, s.frames / 4);
-        if (nb < 8) return;
-        float[] env = new float[nb];
-        float peak = 0;
-        int pk = 0;
+        s.corr = 1f;
+        if (nb < 20) return;
+        float[] raw = new float[nb];
         for (int b = 0; b < nb; b++) {
             double sum = 0;
             for (int i = b * win; i < (b + 1) * win; i++) {
                 float l = s.pcm[2 * i], r = s.pcm[2 * i + 1];
                 sum += l * l + r * r;
             }
-            env[b] = (float) Math.sqrt(sum / (2 * win));
-            if (env[b] > peak) {
-                peak = env[b];
-                pk = b;
+            raw[b] = (float) Math.sqrt(sum / (2 * win));
+        }
+        float[] env = new float[nb];               // 100 ms moving average
+        for (int b = 0; b < nb; b++) {
+            double sum = 0;
+            int c = 0;
+            for (int k = Math.max(0, b - 5); k <= Math.min(nb - 1, b + 5); k++) {
+                sum += raw[k];
+                c++;
             }
+            env[b] = (float) (sum / c);
         }
+        float peak = 0;
+        int pk = 0;
+        for (int b = 0; b < nb; b++) if (env[b] > peak) { peak = env[b]; pk = b; }
         if (peak <= 0) return;
-        float thr = peak * 0.65f;
+        // longest run within -4.5 dB of the peak level; if that is short, accept -7 dB
         int a = pk, z = pk;
-        while (a > 0 && env[a - 1] >= thr) a--;
-        while (z < nb - 1 && env[z + 1] >= thr) z++;
-        // both ends loud, so the seam has the same level: start where it first reaches 90 % of the
-        // peak, end after the last block still above 85 %
-        int a2 = a, z2 = z;
-        while (a2 < z && env[a2] < peak * 0.90f) a2++;
-        while (z2 > a2 && env[z2] < peak * 0.85f) z2--;
-        if ((z2 + 1 - a2) * win >= RATE / 4) {
-            a = a2;
-            z = z2;
-        } else {
-            a = Math.min(a + 1, z);                // skip the first block of the rise
+        float[] lim = {0.60f, 0.45f};
+        for (float f : lim) {
+            a = pk;
+            z = pk;
+            while (a > 0 && env[a - 1] >= peak * f) a--;
+            while (z < nb - 1 && env[z + 1] >= peak * f) z++;
+            if ((z + 1 - a) * win >= RATE * 6 / 10) break;
         }
-        int la = a * win, lb = (z + 1) * win;
-        if (lb - la < RATE / 4) {
-            // too short a steady part: loop the whole sound if it is short, else around the peak
-            if (s.frames < RATE * 6 / 5) return;
-            la = Math.max(0, pk * win - RATE / 8);
-            lb = Math.min(s.frames, la + RATE / 4);
+        // the start: after the attack has settled (first block at 80 % of the run's own average)
+        double avg = 0;
+        for (int b = a; b <= z; b++) avg += env[b];
+        avg /= (z + 1 - a);
+        while (a < z && env[a] < avg * 0.80) a++;
+        while (z > a && env[z] < avg * 0.80) z--;
+        // flattest part: drop a loud first burst (it would come back as a bump every loop) as long as
+        // at least 0.35 s remain
+        float[] part = new float[z + 1 - a];
+        for (int b = a; b <= z; b++) part[b - a] = env[b];
+        java.util.Arrays.sort(part);
+        float med = part[part.length / 2];
+        int minLen = RATE * 35 / 100 / win;
+        while (z - a > minLen && (env[a] > med * 1.10f || env[a] < med * 0.90f)) a++;
+        while (z - a > minLen && (env[z] > med * 1.10f || env[z] < med * 0.90f)) z--;
+        int la = a * win + win, lb = z * win;
+        if (lb - la < RATE / 5) {
+            if (s.frames < RATE) return;            // short sound: loop all of it
+            la = Math.max(0, pk * win - RATE / 10);
+            lb = Math.min(s.frames, la + RATE / 5);
         }
-        int xf = Math.min(RATE * 80 / 1000, (lb - la) / 3);
-        // the cross-fade mixes [lb - xf, lb) with [la, la + xf).  For a tone (horn) two waves that are out of
-        // phase cancel each other - a dip at every seam.  Move the end (+-25 ms) to where the waves match best.
-        int range = RATE * 25 / 1000;
+        int xf = Math.min(RATE * 100 / 1000, (lb - la) / 3);
+        // move the end (+-60 ms, a few pitch periods) to where the waveform just before it matches the one
+        // just before the loop start best: then [end - xf, end) and [la - xf, la) are near copies and the
+        // seam needs only a short, energy-preserving cross-fade
+        int range = RATE * 60 / 1000;
+        int cw = RATE * 30 / 1000;
         int best = lb;
         double bestC = -2;
-        for (int c = Math.max(la + xf + RATE / 10, lb - range); c <= Math.min(s.frames, lb + range); c++) {
+        int lo = Math.max(la + xf + RATE / 10, lb - range), hi = Math.min(s.frames - 1, lb + range);
+        int ref = Math.max(0, la - cw);
+        for (int c = lo; c <= hi; c++) {
             double sab = 0, saa = 0, sbb = 0;
-            for (int i = 0; i < xf; i += 4) {
-                float x = s.pcm[2 * (la + i)] + s.pcm[2 * (la + i) + 1];
-                float y = s.pcm[2 * (c - xf + i)] + s.pcm[2 * (c - xf + i) + 1];
+            for (int i = 0; i < cw; i += 2) {
+                float x = s.pcm[2 * (ref + i)] + s.pcm[2 * (ref + i) + 1];
+                float y = s.pcm[2 * (c - cw + i)] + s.pcm[2 * (c - cw + i) + 1];
                 sab += x * y;
                 saa += x * x;
                 sbb += y * y;
             }
             double cor = (saa > 0 && sbb > 0) ? sab / Math.sqrt(saa * sbb) : -1;
-            if (cor > bestC) {
-                bestC = cor;
-                best = c;
-            }
+            if (cor > bestC) { bestC = cor; best = c; }
         }
         s.loopA = la;
         s.loopB = best;
         s.xf = xf;
+        // correlation of the two parts that are actually mixed (decides the cross-fade weights)
+        double sab = 0, saa = 0, sbb = 0;
+        for (int i = 0; i < xf; i++) {
+            float x = s.pcm[2 * (best - xf + i)] + s.pcm[2 * (best - xf + i) + 1];
+            float y = s.pcm[2 * (la + i)] + s.pcm[2 * (la + i) + 1];
+            sab += x * y;
+            saa += x * x;
+            sbb += y * y;
+        }
+        s.corr = (saa > 0 && sbb > 0) ? (float) Math.max(-1, Math.min(1, sab / Math.sqrt(saa * sbb))) : 0f;
+        s.seamGain = (saa > 0 && sbb > 0) ? (float) Math.min(1.5, Math.max(0.67, Math.sqrt(sbb / saa))) : 1f;
     }
 
     static int le16(byte[] b, int p) { return (b[p] & 255) | ((b[p + 1] & 255) << 8); }
@@ -589,14 +633,16 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         return (short) s;
     }
 
-    /** One playing sound.  Loops while held, plays on to its end (with a fade) when released. */
+    /** One playing sound.  Loops while held; on release it moves (cross-fade) into the sound's own ending. */
     static final class Voice {
         Snd s;
         int pos;           // frame
         boolean held;
         float gain = 1f;
-        float fade = 1f;   // release fade multiplier
-        float fadeStep;
+        float fade = 1f;   // release fade multiplier (only for sounds without an ending of their own)
+        float fadeMul = 1f;
+        int tailPos = -1;  // release: the ending we cross-fade into
+        int tailN, tailK;  // release cross-fade length / progress
         boolean done;
     }
 
@@ -667,10 +713,29 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 Voice o = v[k];
                 if (!o.held) return;
                 o.held = false;
-                // let go: fade out over 0.3 s (shorter ends just play out)
-                int left = o.s.frames - o.pos;
-                int fadeLen = RATE * 3 / 10;
-                if (left > fadeLen) o.fadeStep = 1f / fadeLen;
+                startRelease(o);
+            }
+        }
+
+        /** let go: into the recorded ending (horn tail) or, without one, a smooth 0.45 s fade */
+        static void startRelease(Voice o) {
+            Snd s = o.s;
+            int tail = s.frames - s.loopB;
+            if (o.pos >= s.loopB) return;                       // already in the ending
+            if (o.pos < s.loopA) {                              // still in the attack: just play on
+                if (tail >= RATE / 5) {
+                    o.tailPos = s.loopB - Math.min(s.loopB - o.pos, RATE / 20);
+                    o.tailN = Math.max(1, Math.min(RATE / 20, s.loopB - o.pos));
+                    o.tailK = 0;
+                } else o.fadeMul = (float) Math.exp(Math.log(0.001) / (RATE * 0.45));
+                return;
+            }
+            if (tail >= RATE / 5) {
+                o.tailPos = s.loopB;                            // the ending starts right after the loop body
+                o.tailN = RATE * 80 / 1000;
+                o.tailK = 0;
+            } else {
+                o.fadeMul = (float) Math.exp(Math.log(0.001) / (RATE * 0.45));   // -60 dB in 0.45 s
             }
         }
 
@@ -767,24 +832,44 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                     return;
                 }
                 float l = p[2 * o.pos], r = p[2 * o.pos + 1];
-                if (o.held && o.pos >= s.loopB - s.xf && s.xf > 0) {
-                    // cross-fade into the loop start
+                if (o.held && s.xf > 0 && o.pos >= s.loopB - s.xf) {
+                    // seam: end of the body cross-faded into its start
                     int j = s.loopA + (o.pos - (s.loopB - s.xf));
                     float t = (o.pos - (s.loopB - s.xf)) / (float) s.xf;
-                    l = l * (1f - t) + p[2 * j] * t;
-                    r = r * (1f - t) + p[2 * j + 1] * t;
+                    // linear shape, normalised so the loudness stays the same whatever the two parts' correlation
+                    float k = 1f / (float) Math.sqrt((1f - t) * (1f - t) + t * t + 2f * s.corr * t * (1f - t));
+                    float wa = (1f - t) * k, wb = t * k;
+                    float ga = s.seamGain + (1f - s.seamGain) * t;   // end part brought to the start's level
+                    l = l * wa * ga + p[2 * j] * wb;
+                    r = r * wa * ga + p[2 * j + 1] * wb;
+                }
+                if (o.tailPos >= 0 && o.tailK < o.tailN) {
+                    // release: cross-fade from where we are into the recorded ending
+                    int q = o.tailPos + o.tailK;
+                    if (q < s.frames) {
+                        float t = o.tailK / (float) o.tailN;
+                        float wa = (float) Math.cos(t * Math.PI / 2), wb = (float) Math.sin(t * Math.PI / 2);
+                        l = l * wa + p[2 * q] * wb;
+                        r = r * wa + p[2 * q + 1] * wb;
+                    }
+                    o.tailK++;
+                }
+                int next = o.pos + 1;
+                if (o.tailPos >= 0 && o.tailK >= o.tailN) {
+                    next = o.tailPos + o.tailN;          // the cross-fade is over: carry on in the ending
+                    o.tailPos = -1;
                 }
                 float g = o.gain * o.fade / 32768f;
                 acc[2 * i] += l * g;
                 acc[2 * i + 1] += r * g;
-                if (o.fadeStep > 0f) {
-                    o.fade -= o.fadeStep;
-                    if (o.fade <= 0f) {
+                if (o.fadeMul < 1f) {
+                    o.fade *= o.fadeMul;
+                    if (o.fade < 0.001f) {
                         o.done = true;
                         return;
                     }
                 }
-                o.pos++;
+                o.pos = next;
                 if (o.held && o.pos >= s.loopB) o.pos = s.loopA + s.xf;
             }
         }
