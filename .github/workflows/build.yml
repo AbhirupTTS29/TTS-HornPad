@@ -13,17 +13,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compile TTSHornPad.java to classes3.dex
+      - name: Compile all .java files (TTSHornPad + TTSGate) to classes3.dex
         run: |
           set -e
-          SRC=$(find . -name TTSHornPad.java -not -path './.git/*' | head -1)
-          if [ -z "$SRC" ]; then echo "TTSHornPad.java not found - upload it to the repo first"; exit 1; fi
-          echo "source: $SRC"
+          FILES=$(find . -name '*.java' -not -path './.git/*')
+          echo "sources:"; echo "$FILES"
+          if ! echo "$FILES" | grep -q TTSHornPad.java; then echo "TTSHornPad.java not found - upload it to the repo first"; exit 1; fi
+          if ! echo "$FILES" | grep -q TTSGate.java; then echo "TTSGate.java not found - upload it to the repo first"; exit 1; fi
           SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
           PLAT=$(ls -d "$SDK"/platforms/android-* | sort -V | tail -1)
           BT=$(ls -d "$SDK"/build-tools/* | sort -V | tail -1)
           mkdir -p cls out
-          javac -source 8 -target 8 -nowarn -bootclasspath "$PLAT/android.jar" -d cls "$SRC"
+          javac -source 8 -target 8 -nowarn -bootclasspath "$PLAT/android.jar" -d cls $FILES
           "$BT/d8" --min-api 21 --lib "$PLAT/android.jar" --output out $(find cls -name '*.class')
           mv out/classes.dex out/classes3.dex
           ls -l out
@@ -34,5 +35,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="hornpad-${{ github.run_number }}"
-          gh release create "$TAG" out/classes3.dex --title "TTSHornPad $TAG" --notes "classes3.dex for TTS Trainz Simulator (horn pad)"
+          gh release create "$TAG" out/classes3.dex --title "TTSHornPad $TAG" --notes "classes3.dex for TTS Trainz Simulator (horn pad + login gate)"
           
