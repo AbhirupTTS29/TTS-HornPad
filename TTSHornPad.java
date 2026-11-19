@@ -1821,6 +1821,83 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         final int[] loc = new int[2];
         float sc = 1f;                 // view px per script px
         int downAction = -1;
+        // r127: the game's own menus (camera views, main menu ...) open under the HUD - it is drawn above the
+        // whole game.  A tap on the game's top toolbar hides the HUD; the next tap anywhere (picking a menu item
+        // or closing it) brings it back 0.4 s later, a second toolbar tap at once, and after 20 s in any case.
+        boolean menuHidden;
+        long menuSince;
+        float toolbarH;
+        final Runnable unhide = new Runnable() {
+            public void run() {
+                menuHidden = false;
+                invalidate();
+            }
+        };
+
+        /** other views of the game window that are not ours or the game's surface (TTS camera bar, knobs ...) */
+        java.util.ArrayList<float[]> obstacles() {
+            java.util.ArrayList<float[]> out = new java.util.ArrayList<float[]>();
+            android.view.ViewParent pp = getParent();
+            if (!(pp instanceof ViewGroup)) return out;
+            ViewGroup g = (ViewGroup) pp;
+            getLocationInWindow(loc);
+            int[] o = new int[2];
+            for (int i = 0; i < g.getChildCount(); i++) {
+                View v = g.getChildAt(i);
+                if (v == this || v == pad || v instanceof android.view.SurfaceView || v.getVisibility() != View.VISIBLE) continue;
+                int w = v.getWidth(), hh = v.getHeight();
+                if (w <= 0 || hh <= 0 || w > getWidth() * 0.9f || hh > getHeight() * 0.7f) continue;
+                v.getLocationInWindow(o);
+                out.add(new float[]{o[0] - loc[0], o[1] - loc[1], o[0] - loc[0] + w, o[1] - loc[1] + hh});
+            }
+            return out;
+        }
+
+        /** lowest bottom of the obstacles crossing x range [l, r] that start above yMax (0 = none) */
+        float obstacleBottom(float l, float r, float yMax) {
+            float best = 0;
+            for (float[] b : obstacles()) if (b[2] > l && b[0] < r && b[1] < yMax) best = Math.max(best, b[3]);
+            return best;
+        }
+
+        /** an obstacle overlapping the rect: its right edge (or left edge when toLeft), -1 = none */
+        float obstacleRight(float l, float r, float t, float b, boolean toLeft) {
+            float best = -1;
+            for (float[] o : obstacles()) {
+                if (o[2] <= l || o[0] >= r || o[3] <= t || o[1] >= b) continue;
+                if (toLeft) best = best < 0 ? o[0] : Math.min(best, o[0]);
+                else best = Math.max(best, o[2]);
+            }
+            return best;
+        }
+
+        /** is window point (x, y) inside view v (no side effects) */
+        static boolean onView(View v, float x, float y) {
+            if (v == null || v.getVisibility() != View.VISIBLE) return false;
+            int[] l = new int[2];
+            v.getLocationInWindow(l);
+            return x >= l[0] && y >= l[1] && x < l[0] + v.getWidth() && y < l[1] + v.getHeight();
+        }
+
+        /** a finger came down on the game (not on the HUD), window coordinates */
+        void gameDown(float wx, float wy) {
+            if (getVisibility() != View.VISIBLE) return;
+            getLocationInWindow(loc);
+            float y = wy - loc[1];
+            removeCallbacks(unhide);
+            if (y < toolbarH) {
+                if (menuHidden) {
+                    menuHidden = false;
+                } else {
+                    menuHidden = true;
+                    menuSince = System.currentTimeMillis();
+                    postDelayed(unhide, 20000);
+                }
+                invalidate();
+            } else if (menuHidden) {
+                postDelayed(unhide, 400);
+            }
+        }
         long lastFlash;
         boolean flash;
 
@@ -1837,7 +1914,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
 
         // ---- touch (window coordinates)
         boolean claim(float wx, float wy) {
-            if (getVisibility() != View.VISIBLE) return false;
+            if (getVisibility() != View.VISIBLE || menuHidden) return false;
             getLocationInWindow(loc);
             float x = wx - loc[0], y = wy - loc[1];
             for (int i = hits.size() - 1; i >= 0; i--) {
@@ -1970,6 +2047,8 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             Hud h = hud;
             String[] f = h.t;
             if (!h.active || f == null) return;
+            toolbarH = Math.max(1, Hud.num(f[9], 0)) * (getWidth() / (float) Math.max(1, Hud.num(f[6], getWidth())));
+            if (menuHidden) return;
             long now = System.currentTimeMillis();
             if (now - lastFlash > 400) {
                 lastFlash = now;
@@ -1991,6 +2070,9 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             float bw = clean ? 0.20f * ppi : 0.66f * ppi, bh = 0.13f * ppi;
             float bfs = Math.max(9f * sc, 0.068f * ppi - 11f * sc);
             float bl = side == 1 ? W - bw - 4 * sc : 4 * sc, bt = topPx;
+            // r127: keep clear of the other TTS controls (camera bar, screenshot / record knobs)
+            float ob = obstacleBottom(side == 1 ? W - 1.10f * ppi - 4 * sc : bl, side == 1 ? W : bl + 1.10f * ppi, Hh * 0.5f);
+            if (ob > bt - 2 * sc) bt = ob + 4 * sc;
             if (clean) {
                 box(c, bl, bt, bw, bh, 0x700A1424);
                 textC(c, "UI", bl, bt, bw, bh, bfs, 0xFFC8D4E4, false);
@@ -2007,7 +2089,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             hit(bl + b1, bt, bl + bw, bt + bh, 20);
             if (h.hideAll) return;
 
-            drawMonitor(c, h, f, side, ppi, topPx, bottomFree, fs, fsSmall, rowH, W, Hh);
+            drawMonitor(c, h, f, side, ppi, bt, bottomFree, fs, fsSmall, rowH, W, Hh);
             drawLights(c, h, side, ppi, fs, fsSmall, rowH, W, Hh);
         }
 
@@ -2296,6 +2378,9 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             if (top + panelH > Hh - 0.6f * ppi) top = Hh - 0.6f * ppi - panelH;
             if (top < 40 * sc) top = 40 * sc;
             float L = side == 0 ? W - panelW - 4 * sc : 4 * sc;
+            // r127: beside the TTS screenshot / record knobs instead of on top of them
+            float orr = obstacleRight(L, L + panelW, top, top + panelH, side == 0);
+            if (orr >= 0) L = side == 0 ? orr - panelW - 6 * sc : orr + 6 * sc;
             if (h.lightsOn) box(c, L, top, panelW, panelH, 0xE60A1424);
             box(c, L, top, panelW, rowH + 4 * sc, 0xF412284A);
             box(c, L, top, 4 * sc, rowH + 4 * sc, 0xFFFF8A1E);
@@ -2510,6 +2595,95 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         }
     }
 
+    // ================================================================ r127: our views in TTS screenshots / recordings
+    /**
+     * The TTS screenshot (TTSZoom) and recorder (TTSRecorder) copy only the game's GL surface, so the Java HUD and
+     * the horn pad were missing in them.  Both now call in here (classes2 patched): the screenshot gets the views
+     * drawn onto its bitmap at full size (main thread), the recorder gets a snapshot of them that the main
+     * thread refreshes every 100 ms while a recording asks for it (views must only be drawn on the main thread).
+     */
+    static volatile android.graphics.Bitmap ovl;
+    static volatile long ovlWant;
+    static volatile boolean ovlLoop;
+    static final android.graphics.Bitmap[] ovlBuf = new android.graphics.Bitmap[3];
+    static int ovlNext;
+
+    static void drawViews(Canvas c, int targetW) {
+        HudView hv = hud.view;
+        View root = hv != null && hv.getParent() instanceof View ? (View) hv.getParent() : null;
+        if (root == null || root.getWidth() <= 0) return;
+        float s = targetW / (float) root.getWidth();
+        int[] rl = new int[2];
+        root.getLocationInWindow(rl);
+        View[] vs = {hv, pad};
+        for (View v : vs) {
+            if (v == null || v.getVisibility() != View.VISIBLE || v.getWidth() <= 0) continue;
+            int[] l = new int[2];
+            v.getLocationInWindow(l);
+            int save = c.save();
+            c.scale(s, s);
+            c.translate(l[0] - rl[0], l[1] - rl[1]);
+            v.draw(c);
+            c.restoreToCount(save);
+        }
+    }
+
+    /** screenshot: called on the main thread with the copied game picture */
+    public static void overlayBitmap(android.graphics.Bitmap bm) {
+        try {
+            if (bm != null && bm.isMutable()) drawViews(new Canvas(bm), bm.getWidth());
+        } catch (Throwable t) {
+            log("shot overlay: " + t);
+        }
+    }
+
+    /** recorder: called on its own thread for every frame, after the game picture is drawn */
+    public static void overlay(Canvas c, int w, int h) {
+        try {
+            ovlWant = System.currentTimeMillis();
+            if (!ovlLoop) {
+                ovlLoop = true;
+                H.post(ovlTick);
+            }
+            android.graphics.Bitmap b = ovl;
+            if (b != null) c.drawBitmap(b, null, new android.graphics.Rect(0, 0, w, h), null);
+        } catch (Throwable t) {
+            // the frame goes out without the HUD
+        }
+    }
+
+    static final Runnable ovlTick = new Runnable() {
+        public void run() {
+            if (System.currentTimeMillis() - ovlWant > 1500) {
+                ovlLoop = false;
+                ovl = null;
+                for (int i = 0; i < ovlBuf.length; i++) ovlBuf[i] = null;
+                return;
+            }
+            try {
+                HudView hv = hud.view;
+                View root = hv != null && hv.getParent() instanceof View ? (View) hv.getParent() : null;
+                if (root != null && root.getWidth() > 0 && root.getHeight() > 0) {
+                    int rw = root.getWidth(), rh = root.getHeight();
+                    int tw = Math.min(rw, 1280 * rw / Math.max(rw, rh));
+                    int th = Math.max(1, tw * rh / rw);
+                    android.graphics.Bitmap b = ovlBuf[ovlNext];
+                    if (b == null || b.getWidth() != tw || b.getHeight() != th) {
+                        b = android.graphics.Bitmap.createBitmap(tw, th, android.graphics.Bitmap.Config.ARGB_8888);
+                        ovlBuf[ovlNext] = b;
+                    }
+                    b.eraseColor(0);
+                    drawViews(new Canvas(b), tw);
+                    ovl = b;
+                    ovlNext = (ovlNext + 1) % ovlBuf.length;
+                }
+            } catch (Throwable t) {
+                log("rec overlay: " + t);
+            }
+            H.postDelayed(this, 100);
+        }
+    };
+
     // ================================================================ touch router
     /**
      * The game reads touches in its Activity.onTouchEvent, which only runs when no view takes the
@@ -2584,7 +2758,10 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             int ai = ev.getActionIndex();
             // r126: HUD panels take a whole one-finger gesture (the game never sees it)
             HudView hv = hud.view;
-            if (act == MotionEvent.ACTION_DOWN && padId < 0) hudTouch = hv != null && hv.claim(ev.getX(), ev.getY());
+            if (act == MotionEvent.ACTION_DOWN && padId < 0) {
+                hudTouch = hv != null && hv.claim(ev.getX(), ev.getY());
+                if (!hudTouch && hv != null && !HudView.onView(p, ev.getX(), ev.getY())) hv.gameDown(ev.getX(), ev.getY());
+            }
             if (hudTouch) {
                 if (act == MotionEvent.ACTION_UP) {
                     hudTouch = false;
