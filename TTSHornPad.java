@@ -2850,6 +2850,10 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
     static final int[] DIR_COL_OFF = {0, 0xFF8FA2C4, 0xFF8FA2C4, 0xFF8FA2C4, 0xFF8FA2C4};
     static final String[] LABEL = {"", "HORN", "EXTRA", "BELL", "SAND"};
     static final String[] EDIT_LABEL = {"", "+", "OK", "−", "HIDE"};
+    // r138: preset 2 = the horn / bell / sander of the .sms sound set (Open Rails events 8/9, 10/11, 4/5)
+    static final String[] LABEL2 = {"", "HORN", "HORN", "BELL", "SAND"};
+    static final int[] EV_ON = {0, 8, 8, 10, 4};
+    static final int[] EV_OFF = {0, 9, 9, 11, 5};
     static final float MIN_SCALE = 0.5f, MAX_SCALE = 1.8f;
 
     /**
@@ -2879,6 +2883,9 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         int editAct;                   // settings: side touched (tap on release)
         boolean miniTap, miniDrag;
         boolean gearTap;               // r118: the small gear button at the top-right corner
+        int preset = 1;                // r138: 1 = the pad's own sounds, 2 = the .sms sound set's horns
+        boolean badgeTap;              // r138: the small preset button at the top-left corner
+        boolean pressedSms;            // the side held now plays through the .sms
         float downX, downY;
         int startLeft, startTop;
         final Runnable longPress = new Runnable() {
@@ -2930,6 +2937,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 uy = sp.getFloat("y", 0.32f);
                 scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, sp.getFloat("scale", 1f)));
                 hidden = sp.getBoolean("hidden", false);
+                preset = sp.getInt("preset", 1) == 2 ? 2 : 1;
             } catch (Throwable t) {
                 userPlaced = false;
             }
@@ -2993,9 +3001,32 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             size = d;
         }
 
+        boolean smsOk() {
+            return preset == 2 && TTSSms.active();
+        }
+
+        void pressSide(int k) {
+            if (smsOk()) {
+                pressedSms = true;
+                TTSSms.post(EV_ON[k]);
+            } else {
+                pressedSms = false;
+                mixer.press(k);
+            }
+        }
+
+        void releaseSide(int k) {
+            if (pressedSms) {
+                pressedSms = false;
+                TTSSms.post(EV_OFF[k]);
+            } else {
+                mixer.release(k);
+            }
+        }
+
         void dropTouch() {
             removeCallbacks(longPress);
-            if (dir != 0) mixer.release(dir);
+            if (dir != 0) releaseSide(dir);
             dir = 0;
             held = false;
             editDrag = false;
@@ -3003,6 +3034,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             miniTap = false;
             miniDrag = false;
             gearTap = false;
+            badgeTap = false;
             post(spring);
         }
 
@@ -3028,13 +3060,15 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             getLocationInWindow(loc);
             float c = getWidth() / 2f, R = c - 2;
             float dx = wx - loc[0] - c, dy = wy - loc[1] - c;
-            boolean gear = false;
+            boolean gear = false, badge = false;
             if (!hidden) {
                 float g = getWidth() * 0.11f;
                 float gx = wx - loc[0] - (getWidth() - g), gy = wy - loc[1] - g;
                 gear = gx * gx + gy * gy < g * g * 2.0f;
+                float bx = wx - loc[0] - g, by = wy - loc[1] - g;
+                badge = !edit && bx * bx + by * by < g * g * 2.0f;
             }
-            if (!gear && dx * dx + dy * dy > R * R) return false;   // outside the circle: the game gets it
+            if (!gear && !badge && dx * dx + dy * dy > R * R) return false;   // outside the circle: the game gets it
             held = true;
             downX = wx;
             downY = wy;
@@ -3046,6 +3080,11 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             if (hidden) {
                 miniTap = true;
                 miniDrag = false;
+                invalidate();
+                return true;
+            }
+            if (badge) {
+                badgeTap = true;
                 invalidate();
                 return true;
             }
@@ -3079,6 +3118,10 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 if (far > 40 * 40) gearTap = false;
                 return;
             }
+            if (badgeTap) {
+                if (far > 40 * 40) badgeTap = false;
+                return;
+            }
             if (hidden) {
                 if (far > 22 * 22) {
                     miniTap = false;
@@ -3105,12 +3148,23 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             if (!held) return;
             held = false;
             removeCallbacks(longPress);
+            if (badgeTap) {
+                badgeTap = false;
+                if (!cancel) {
+                    preset = preset == 1 ? 2 : 1;
+                    savePrefs();
+                    log("preset " + preset + (preset == 2 ? (TTSSms.active() ? " (.sms horns)" : " (no .sms loaded: pad sounds)") : ""));
+                    performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+                }
+                invalidate();
+                return;
+            }
             if (gearTap) {
                 gearTap = false;
                 if (!cancel) {
                     edit = !edit;
                     log("settings " + (edit ? "open" : "closed"));
-                    if (dir != 0) mixer.release(dir);
+                    if (dir != 0) releaseSide(dir);
                     dir = 0;
                     kx = 0;
                     ky = 0;
@@ -3137,7 +3191,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 invalidate();
                 return;
             }
-            if (dir != 0) mixer.release(dir);
+            if (dir != 0) releaseSide(dir);
             dir = 0;
             post(spring);
             invalidate();
@@ -3162,7 +3216,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         void setHidden(boolean h) {
             hidden = h;
             if (h) {
-                if (dir != 0) mixer.release(dir);
+                if (dir != 0) releaseSide(dir);
                 dir = 0;
             }
             kx = 0;
@@ -3198,11 +3252,11 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 else nd = dy < 0 ? 1 : 3;
             }
             if (nd != dir) {
-                if (dir != 0) mixer.release(dir);
+                if (dir != 0) releaseSide(dir);
                 dir = nd;
                 if (nd != 0) {
                     removeCallbacks(longPress);
-                    mixer.press(nd);
+                    pressSide(nd);
                     performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
                 }
             }
@@ -3225,7 +3279,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             try {
                 getContext().getSharedPreferences("tts_hornpad", Context.MODE_PRIVATE).edit()
                         .putBoolean("placed", userPlaced).putFloat("x", ux).putFloat("y", uy)
-                        .putFloat("scale", scale).putBoolean("hidden", hidden).apply();
+                        .putFloat("scale", scale).putBoolean("hidden", hidden).putInt("preset", preset).apply();
             } catch (Throwable t) {
                 log("prefs: " + t);
             }
@@ -3296,7 +3350,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                     continue;
                 }
                 text.setTextSize(Math.max(9f, R * 0.115f));
-                boolean ok = mixer.has(k);
+                boolean ok = preset == 2 && TTSSms.active() ? true : mixer.has(k);
                 boolean on = (k == dir);
                 int col = on ? 0xFF2EA8FF : (ok ? 0xFF8FA2C4 : 0xFF4A5468);
                 fill.setColor(col);
@@ -3315,7 +3369,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                     tx = px + dr * 2.2f;
                     ty = py + text.getTextSize() * 0.35f;
                 }
-                cv.drawText(LABEL[k], tx, ty, text);
+                cv.drawText(preset == 2 && TTSSms.active() ? LABEL2[k] : LABEL[k], tx, ty, text);
                 text.setTextAlign(Paint.Align.CENTER);
             }
             // knob
@@ -3335,6 +3389,26 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 speaker(cv, x, y, rk * 0.55f);
             }
             gear(cv);
+            if (!edit) badge(cv);
+        }
+
+        /** r138: preset button at the top-left corner: 1 = pad sounds, 2 = .sms horns */
+        void badge(Canvas cv) {
+            float w = getWidth();
+            float g = w * 0.11f;
+            float gx = g, gy = g, r = g * 0.82f;
+            boolean two = preset == 2;
+            fill.setStyle(Paint.Style.FILL);
+            fill.setColor(badgeTap ? 0xFF2EA8FF : (two ? 0xFF1E88E5 : 0xD80B1322));
+            cv.drawCircle(gx, gy, r, fill);
+            fill.setStyle(Paint.Style.STROKE);
+            fill.setStrokeWidth(Math.max(1.5f, r * 0.10f));
+            fill.setColor(0xCC2EA8FF);
+            cv.drawCircle(gx, gy, r * 0.97f, fill);
+            fill.setStyle(Paint.Style.FILL);
+            text.setColor(0xFFFFFFFF);
+            text.setTextSize(Math.max(9f, r * 1.05f));
+            cv.drawText(two ? "2" : "1", gx, gy + text.getTextSize() * 0.36f, text);
         }
 
         /** r118: settings button in the free top-right corner of the pad's square */
