@@ -2263,6 +2263,15 @@ public final class TTSSms {
             }
             if (al.sampleRate > 0) al.setPlaybackSpeed(y / al.sampleRate);
         }
+        // r142: horn / bell / sander fade like the horn pad's own sound: full loudness up to 12 m, then 1/r
+        // (the .sms curves keep them near full gain out to ~100 m, because the 1.0 AL gain clamp hides the fall)
+        final float hornRef = 12f;
+        boolean hornLaw = v.dist > hornRef && st.src.keep.contains(st);
+        float realDist = v.dist, realSq = st.src.distSq;
+        if (hornLaw) {
+            v.dist = hornRef;
+            st.src.distSq = hornRef * hornRef;
+        }
         float volume = st.src.volume * st.volume;
         for (Curve c : st.vol) volume *= c.at(st.read(c.var, v));
         // in the cab / a coach the outside sounds come through the body (ExternalSoundPassThruPercent 50)
@@ -2275,6 +2284,12 @@ public final class TTSSms {
             if (d < 8f) d = 8f;
             if (d > 2000f) d = 2000f;
             atten = 8f / (8f + st.src.rolloff * (d - 8f));
+        }
+        if (hornLaw) {
+            v.dist = realDist;
+            st.src.distSq = realSq;
+            al.setVolumeValue(Math.min(1f, volume * atten), st.src.eng);   // the loudness at 12 m, then 1/r
+            atten = hornRef / realDist;
         }
         al.atten = atten;
     }
