@@ -11,6 +11,7 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Path;
+import android.graphics.RectF;
 import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioTrack;
@@ -90,6 +91,14 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
     public void onActivityResumed(Activity a) {
         try {
             if (!GAME.equals(a.getClass().getName())) return;
+            if (owner != a || hud.view == null || hud.view.getParent() == null) {
+                hud.loadPrefs(a);
+                HudView hv = new HudView(a);
+                a.addContentView(hv, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT));
+                hud.view = hv;
+                hv.update();
+            }
             if (owner != a || pad == null || pad.getParent() == null) {
                 owner = a;
                 pad = new PadView(a);
@@ -103,6 +112,8 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             installRouter(a);
             watcher.start(a);
             weather.setPaused(false);
+            hud.resume();
+            boost.start();
         } catch (Throwable t) {
             log("attach: " + t);
         }
@@ -114,6 +125,8 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             if (a == owner) {
                 mixer.stopAll();
                 weather.setPaused(true);
+                hud.pause();
+                boost.stop();
                 if (pad != null) pad.dropTouch();
             }
         } catch (Throwable t) {
@@ -127,6 +140,9 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             if (a == owner) {
                 mixer.stopAll();
                 weather.setRain(0);
+                hud.pause();
+                boost.stop();
+                hud.view = null;
                 owner = null;
                 pad = null;
                 if (routedFor == a) routedFor = null;
@@ -199,7 +215,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                     log("poll: " + t);
                 }
                 try {
-                    Thread.sleep(300);
+                    Thread.sleep(hud.active ? 100 : 300);
                 } catch (InterruptedException e) {
                     return;
                 }
@@ -255,6 +271,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             pos += end;
             String s = new String(buf, 0, end, "ISO-8859-1");
             weatherFromLog(s);
+            hud.fromLog(s);
             camFromLog(s);
             int i = s.lastIndexOf("TTSJOY: o");
             // the driver session ended (back to the menu, Surveyor / edit session): the game's script
@@ -1517,6 +1534,982 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         }
     }
 
+    // ================================================================ r126: HUD overlay (track monitor, LIGHTS, TTS hide, clean view)
+    /**
+     * The TTS HUD drawn here instead of the game's HTML windows: the script (driver module) only sends the
+     * data (TTSHV / TTSHT / TTSHO / TTSHP / TTSHL lines in Trainz.log) and reads the buttons tapped here from
+     * the libttsshrink mailbox (Hud.send -> tts_cmd.txt).  A tap is answered on screen at once; folding,
+     * compact view and TTS hide are kept here (no round trip at all).  While this overlay lives it says so
+     * every 2 s (command 999); without that the script goes back to its own HTML panels by itself.
+     */
+    static final Hud hud = new Hud();
+
+    static final class Hud {
+        // ---- data from the script (watcher thread writes, UI thread reads)
+        volatile boolean active;              // the script draws nothing itself, we show the HUD
+        volatile int spdDm, limK = -1, over, trav, projK, rev;
+        volatile String[] t;                  // TTSHT fields
+        volatile int[][] obj = new int[0][];  // k, side, dist, val, lim, aspect level, route
+        volatile int[] prof;                  // here + 20 columns (dm), Integer.MIN_VALUE = no data
+        volatile String[] lights;             // TTSHL fields
+        volatile long objTime;                // when the objects came (distances run on with the speed)
+        volatile int objTrav;
+        // ---- kept here (instant)
+        boolean monOn = true, compact, lightsOn = true, hideAll;
+        boolean prefsLoaded;
+        // ---- optimistic states until the script confirms (ms time stamps)
+        long cleanUntil, lightUntil[] = new long[8];
+        boolean cleanWant, lightWant[] = new boolean[8];
+        HudView view;
+
+        static String[] split(String s, char c) {
+            java.util.ArrayList<String> a = new java.util.ArrayList<String>();
+            int p = 0;
+            for (int i = 0; i <= s.length(); i++) {
+                if (i == s.length() || s.charAt(i) == c) {
+                    a.add(s.substring(p, i));
+                    p = i + 1;
+                }
+            }
+            return a.toArray(new String[0]);
+        }
+
+        static int num(String s, int def) {
+            try {
+                return Integer.parseInt(s.trim());
+            } catch (Throwable e) {
+                return def;
+            }
+        }
+
+        static String lineAfter(String s, String key) {
+            int i = s.lastIndexOf(key);
+            if (i < 0) return null;
+            int e = s.indexOf('\n', i);
+            if (e < 0) e = s.length();
+            String l = s.substring(i + key.length(), e);
+            if (l.endsWith("\r")) l = l.substring(0, l.length() - 1);
+            return l;
+        }
+
+        /** the HUD lines of one poll of Trainz.log */
+        void fromLog(String s) {
+            boolean changed = false;
+            int done = Math.max(s.lastIndexOf("GSRouter::Done()"), s.lastIndexOf("TTSUI: java hud off"));
+            int startAt = Math.max(Math.max(s.lastIndexOf("TTSHT: "), s.lastIndexOf("TTSHV: ")), s.lastIndexOf("TTSUI: java hud on"));
+            if (done >= 0 && done > startAt) {
+                if (active) {
+                    active = false;
+                    changed = true;
+                    log("hud: off");
+                }
+            }
+            String l = lineAfter(s, "TTSHV: ");
+            if (l != null && s.lastIndexOf("TTSHV: ") > done) {
+                String[] f = split(l.trim(), ' ');
+                if (f.length >= 6) {
+                    spdDm = num(f[0], 0);
+                    limK = num(f[1], -1);
+                    over = num(f[2], 0);
+                    trav = num(f[3], 0);
+                    projK = num(f[4], 0);
+                    rev = num(f[5], 0);
+                    changed = true;
+                }
+            }
+            l = lineAfter(s, "TTSHT: ");
+            if (l != null && s.lastIndexOf("TTSHT: ") > done) {
+                String[] f = split(l, '^');
+                if (f.length >= 24) {
+                    t = f;
+                    if (!active) log("hud: on");
+                    active = true;
+                    changed = true;
+                    if (cleanUntil != 0 && (num(f[5], 0) != 0) == cleanWant) cleanUntil = 0;
+                }
+            }
+            l = lineAfter(s, "TTSHO: ");
+            if (l != null && s.lastIndexOf("TTSHO: ") > done) {
+                String[] f = split(l.trim(), ';');
+                java.util.ArrayList<int[]> a = new java.util.ArrayList<int[]>();
+                for (String o : f) {
+                    if (o.length() == 0) continue;
+                    String[] g = split(o, ',');
+                    if (g.length < 7) continue;
+                    int[] v = new int[7];
+                    for (int i = 0; i < 7; i++) v[i] = num(g[i], 0);
+                    a.add(v);
+                }
+                obj = a.toArray(new int[0][]);
+                objTrav = trav;
+                objTime = System.currentTimeMillis();
+                changed = true;
+            }
+            l = lineAfter(s, "TTSHP: ");
+            if (l != null && s.lastIndexOf("TTSHP: ") > done) {
+                String[] f = split(l.trim(), ',');
+                int[] p = new int[f.length];
+                for (int i = 0; i < f.length; i++) p[i] = f[i].equals("x") ? Integer.MIN_VALUE : num(f[i], Integer.MIN_VALUE);
+                prof = p;
+                changed = true;
+            }
+            l = lineAfter(s, "TTSHL: ");
+            if (l != null && s.lastIndexOf("TTSHL: ") > done) {
+                String[] f = split(l, '^');
+                if (f.length >= 9) {
+                    lights = f;
+                    for (int i = 0; i < 8; i++)
+                        if (lightUntil[i] != 0 && i < 7 && (num(f[i], 0) != 0) == lightWant[i]) lightUntil[i] = 0;
+                    changed = true;
+                }
+            }
+            if (changed) refresh();
+        }
+
+        void refresh() {
+            H.post(new Runnable() {
+                public void run() {
+                    HudView v = view;
+                    if (v != null) v.update();
+                }
+            });
+        }
+
+        // ---- commands to the script
+        static final Object cmdLock = new Object();
+        static long cmdId;
+        static final java.util.ArrayList<String> cmdLines = new java.util.ArrayList<String>();
+        static Thread cmdThread;
+        static boolean cmdDirty;
+
+        static void send(final int cmd) {
+            synchronized (cmdLock) {
+                long id = System.currentTimeMillis() * 100;
+                if (id <= cmdId) id = cmdId + 1;
+                cmdId = id;
+                cmdLines.add(id + " " + cmd);
+                while (cmdLines.size() > 16) cmdLines.remove(0);
+                cmdDirty = true;
+                if (cmdThread == null || !cmdThread.isAlive()) {
+                    cmdThread = new Thread(new Runnable() {
+                        public void run() {
+                            cmdLoop();
+                        }
+                    }, "TTSHudCmd");
+                    cmdThread.setDaemon(true);
+                    cmdThread.start();
+                }
+                cmdLock.notifyAll();
+            }
+        }
+
+        static void cmdLoop() {
+            File dir = new File("/sdcard/Android/media/com.n3vgames.android.trainz");
+            while (true) {
+                String text;
+                synchronized (cmdLock) {
+                    while (!cmdDirty) {
+                        try {
+                            cmdLock.wait();
+                        } catch (InterruptedException e) {
+                            return;
+                        }
+                    }
+                    cmdDirty = false;
+                    StringBuilder b = new StringBuilder();
+                    for (String l : cmdLines) b.append(l).append('\n');
+                    text = b.toString();
+                }
+                try {
+                    dir.mkdirs();
+                    File tmp = new File(dir, "tts_cmd.tmp");
+                    java.io.FileOutputStream o = new java.io.FileOutputStream(tmp, false);
+                    try {
+                        o.write(text.getBytes("ISO-8859-1"));
+                    } finally {
+                        o.close();
+                    }
+                    if (!tmp.renameTo(new File(dir, "tts_cmd.txt"))) log("hud: rename failed");
+                } catch (Throwable e) {
+                    log("hud cmd: " + e);
+                }
+            }
+        }
+
+        // ---- heartbeat: "the overlay is here" every 2 s while the game is in front
+        volatile boolean beating;
+        final Runnable beat = new Runnable() {
+            public void run() {
+                if (!beating) return;
+                send(999);
+                H.postDelayed(this, 2000);
+            }
+        };
+
+        void resume() {
+            if (!beating) {
+                beating = true;
+                H.post(beat);
+            }
+        }
+
+        void pause() {
+            beating = false;
+            H.removeCallbacks(beat);
+        }
+
+        // ---- per-viewer settings
+        void loadPrefs(Context c) {
+            if (prefsLoaded) return;
+            prefsLoaded = true;
+            try {
+                SharedPreferences sp = c.getSharedPreferences("tts_hud", Context.MODE_PRIVATE);
+                monOn = sp.getBoolean("monOn", true);
+                compact = sp.getBoolean("compact", false);
+                lightsOn = sp.getBoolean("lightsOn", true);
+                hideAll = sp.getBoolean("hideAll", false);
+            } catch (Throwable e) {
+                log("hud prefs: " + e);
+            }
+        }
+
+        void savePrefs(Context c) {
+            try {
+                c.getSharedPreferences("tts_hud", Context.MODE_PRIVATE).edit().putBoolean("monOn", monOn)
+                        .putBoolean("compact", compact).putBoolean("lightsOn", lightsOn).putBoolean("hideAll", hideAll).apply();
+            } catch (Throwable e) {
+                log("hud prefs: " + e);
+            }
+        }
+
+        boolean clean() {
+            String[] f = t;
+            boolean gs = f != null && num(f[5], 0) != 0;
+            if (cleanUntil != 0 && System.currentTimeMillis() < cleanUntil) return cleanWant;
+            cleanUntil = 0;
+            return gs;
+        }
+
+        boolean light(int i) {
+            String[] f = lights;
+            boolean gs = f != null && num(f[i], 0) != 0;
+            if (lightUntil[i] != 0 && System.currentTimeMillis() < lightUntil[i]) return lightWant[i];
+            lightUntil[i] = 0;
+            return gs;
+        }
+    }
+
+    static int col(String s, int def) {
+        try {
+            if (s == null) return def;
+            s = s.trim();
+            if (!s.startsWith("#")) return def;
+            long v = Long.parseLong(s.substring(1), 16);
+            if (s.length() == 7) return (int) (0xFF000000L | v);
+            if (s.length() == 9) return (int) (((v & 0xFF) << 24) | (v >>> 8));     // #RRGGBBAA (the HUD's own)
+        } catch (Throwable e) {
+            // keep
+        }
+        return def;
+    }
+
+    /** one full-screen view that draws the HUD panels; taps come from the Router (claim / tap) */
+    static final class HudView extends View {
+        final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        final RectF r = new RectF(0, 0, 0, 0);
+        final java.util.ArrayList<float[]> hits = new java.util.ArrayList<float[]>();   // l, t, r, b, action
+        final int[] loc = new int[2];
+        float sc = 1f;                 // view px per script px
+        int downAction = -1;
+        long lastFlash;
+        boolean flash;
+
+        HudView(Context c) {
+            super(c);
+        }
+
+        void update() {
+            boolean show = hud.active && hud.t != null && Hud.num(hud.t[0], 0) != 0;
+            int v = show ? View.VISIBLE : View.GONE;
+            if (getVisibility() != v) setVisibility(v);
+            if (show) invalidate();
+        }
+
+        // ---- touch (window coordinates)
+        boolean claim(float wx, float wy) {
+            if (getVisibility() != View.VISIBLE) return false;
+            getLocationInWindow(loc);
+            float x = wx - loc[0], y = wy - loc[1];
+            for (int i = hits.size() - 1; i >= 0; i--) {
+                float[] h = hits.get(i);
+                if (x >= h[0] && x < h[2] && y >= h[1] && y < h[3]) {
+                    downAction = (int) h[4];
+                    return true;
+                }
+            }
+            downAction = -1;
+            return false;
+        }
+
+        void tap(float wx, float wy) {
+            int a = downAction;
+            downAction = -1;
+            if (a < 0) return;
+            getLocationInWindow(loc);
+            float x = wx - loc[0], y = wy - loc[1];
+            boolean inside = false;
+            for (float[] h : hits) if ((int) h[4] == a && x >= h[0] - 30 && x < h[2] + 30 && y >= h[1] - 30 && y < h[3] + 30) inside = true;
+            if (!inside) return;
+            try {
+                performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+            } catch (Throwable e) {
+                // no haptics
+            }
+            act(a);
+        }
+
+        void act(int a) {
+            Hud h = hud;
+            long now = System.currentTimeMillis();
+            switch (a) {
+                case 1:       // fold the monitor
+                    h.monOn = !h.monOn;
+                    break;
+                case 2: {     // title: acknowledge VCD / penalty, else compact view
+                    String[] f = h.t;
+                    if (f != null && Hud.num(f[12], 0) != 0) Hud.send(2);
+                    else h.compact = !h.compact;
+                    break;
+                }
+                case 3:
+                    Hud.send(3);
+                    break;
+                case 4:
+                    Hud.send(4);
+                    break;
+                case 5:
+                    h.hideAll = !h.hideAll;
+                    break;
+                case 6:
+                    h.lightsOn = !h.lightsOn;
+                    break;
+                case 20:
+                    h.cleanWant = !h.clean();
+                    h.cleanUntil = now + 1500;
+                    Hud.send(20);
+                    break;
+                case 21:
+                    Hud.send(21);
+                    break;
+                default:
+                    if (a >= 10 && a <= 17) {
+                        int i = LIGHT_IDX[a - 10];
+                        if (i >= 0) {
+                            h.lightWant[i] = !h.light(i);
+                            h.lightUntil[i] = now + 1500;
+                        } else {                           // all markers: front and back together
+                            boolean both = !(h.light(2) && h.light(3));
+                            h.lightWant[2] = both;
+                            h.lightWant[3] = both;
+                            h.lightUntil[2] = now + 1500;
+                            h.lightUntil[3] = now + 1500;
+                        }
+                        Hud.send(a);
+                    }
+            }
+            h.savePrefs(getContext());
+            invalidate();
+        }
+
+        // command 10..17 (tts-l0..l7) -> index in the TTSHL fields (-1 = no own field)
+        static final int[] LIGHT_IDX = {0, -1, 2, 3, 4, 5, 6, 1};
+
+        void hit(float l, float tp, float rt, float b, int a) {
+            hits.add(new float[]{l, tp, rt, b, a});
+        }
+
+        void box(Canvas c, float l, float tp, float w, float h, int color) {
+            p.setStyle(Paint.Style.FILL);
+            p.setColor(color);
+            c.drawRect(l, tp, l + w, tp + h, p);
+        }
+
+        void text(Canvas c, String s, float x, float tp, float size, int color, boolean bold, float maxW) {
+            if (s == null) return;
+            p.setStyle(Paint.Style.FILL);
+            p.setColor(color);
+            p.setTextSize(size);
+            p.setFakeBoldText(bold);
+            p.setTextAlign(Paint.Align.LEFT);
+            if (maxW > 0 && p.measureText(s) > maxW) {
+                while (s.length() > 1 && p.measureText(s + ".") > maxW) s = s.substring(0, s.length() - 1);
+                s = s + ".";
+            }
+            c.drawText(s, x, tp + size * 0.86f, p);
+        }
+
+        void textC(Canvas c, String s, float l, float tp, float w, float h, float size, int color, boolean bold) {
+            p.setStyle(Paint.Style.FILL);
+            p.setColor(color);
+            p.setTextSize(size);
+            p.setFakeBoldText(bold);
+            p.setTextAlign(Paint.Align.CENTER);
+            c.drawText(s, l + w / 2f, tp + h / 2f + size * 0.34f, p);
+            p.setTextAlign(Paint.Align.LEFT);
+        }
+
+        static String dist(float d) {
+            if (d < 1000f) return ((int) (d / 10f + 0.5f) * 10) + " m";
+            int t = (int) (d / 100f + 0.5f);
+            return (t / 10) + "." + (t % 10) + " km";
+        }
+
+        @Override
+        protected void onDraw(Canvas c) {
+            hits.clear();
+            Hud h = hud;
+            String[] f = h.t;
+            if (!h.active || f == null) return;
+            long now = System.currentTimeMillis();
+            if (now - lastFlash > 400) {
+                lastFlash = now;
+                flash = !flash;
+            }
+            int sw = Math.max(1, Hud.num(f[6], getWidth()));
+            sc = getWidth() / (float) sw;
+            float ppi = Hud.num(f[8], 326) * sc;
+            int side = Hud.num(f[1], 0);
+            float topPx = Hud.num(f[9], 0) * sc;
+            float bottomFree = Hud.num(f[10], 0) * sc;
+            float W = getWidth(), Hh = getHeight();
+            boolean clean = h.clean();
+            float fs = Math.max(11f * sc, 0.068f * ppi - 8f * sc);
+            float fsSmall = Math.max(10f * sc, fs - 3f * sc);
+            float rowH = fs + 7f * sc;
+
+            // ---- button bar: TTS hide | Clean view  (clean: a small UI button)
+            float bw = clean ? 0.20f * ppi : 0.66f * ppi, bh = 0.13f * ppi;
+            float bfs = Math.max(9f * sc, 0.068f * ppi - 11f * sc);
+            float bl = side == 1 ? W - bw - 4 * sc : 4 * sc, bt = topPx;
+            if (clean) {
+                box(c, bl, bt, bw, bh, 0x700A1424);
+                textC(c, "UI", bl, bt, bw, bh, bfs, 0xFFC8D4E4, false);
+                hit(bl, bt, bl + bw, bt + bh, 20);
+                return;
+            }
+            float b1 = bw * 0.52f;
+            box(c, bl, bt, b1 - 2 * sc, bh, h.hideAll ? 0xEC4A2A06 : 0xEC12284A);
+            box(c, bl, bt, 3 * sc, bh, 0xFFFF8A1E);
+            textC(c, h.hideAll ? "TTS show" : "TTS hide", bl, bt, b1 - 2 * sc, bh, bfs, 0xFFFFB733, false);
+            hit(bl, bt, bl + b1 - 2 * sc, bt + bh, 5);
+            box(c, bl + b1, bt, bw - b1, bh, 0xEC24406E);
+            textC(c, "Clean view", bl + b1, bt, bw - b1, bh, bfs, 0xFFFFFFFF, false);
+            hit(bl + b1, bt, bl + bw, bt + bh, 20);
+            if (h.hideAll) return;
+
+            drawMonitor(c, h, f, side, ppi, topPx, bottomFree, fs, fsSmall, rowH, W, Hh);
+            drawLights(c, h, side, ppi, fs, fsSmall, rowH, W, Hh);
+        }
+
+        void drawMonitor(Canvas c, Hud h, String[] f, int side, float ppi, float topPx, float bottomFree,
+                         float fs, float fsSmall, float rowH, float W, float Hh) {
+            float hh = rowH + 8 * sc;
+            float panelW = 1.10f * ppi, panelH = 3.60f * ppi;
+            float top = topPx + 0.13f * ppi + 5 * sc;
+            if (!h.monOn) panelH = hh;
+            else if (h.compact) panelH = hh + 4 * sc + 3 * (rowH + 2 * sc) + 12 * sc;
+            if (top + panelH > Hh - bottomFree) panelH = Hh - bottomFree - top;
+            if (panelH < hh) panelH = hh;
+            float L = side == 1 ? W - panelW - 4 * sc : 4 * sc;
+            int tst = Hud.num(f[12], 0);
+            if (tst != 0 || h.over != 0) postInvalidateDelayed(400);     // the title flashes
+            int cTitle = 0xF412284A;
+            if (tst == 1 || h.over != 0) cTitle = flash ? 0xF4C80000 : 0xF4640000;
+            else if (tst == 2) cTitle = flash ? 0xF4C88000 : 0xF4644000;
+            if (h.monOn) box(c, L, top, panelW, panelH, 0xE60A1424);
+            box(c, L, top, panelW, hh, cTitle);
+            box(c, L, top, 4 * sc, hh, 0xFFFF8A1E);
+            box(c, L, top + hh - 2 * sc, panelW, 2 * sc, 0xFFFF8A1E);
+            float foldW = 0.22f * ppi;
+            String title = f[11];
+            if (h.compact && tst == 0 && h.over == 0 && title.equals("TRACK MONITOR")) title = "MONITOR  mini";
+            text(c, title, L + 12 * sc, top + 4 * sc, fs, 0xFFFFFFFF, true, panelW - foldW - 22 * sc);
+            hit(L, top, L + panelW - foldW - 8 * sc, top + hh, 2);
+            box(c, L + panelW - foldW - 5 * sc, top + 4 * sc, foldW, hh - 10 * sc, 0xFF24406E);
+            textC(c, h.monOn ? "-" : "+", L + panelW - foldW - 5 * sc, top + 4 * sc, foldW, hh - 10 * sc, fs, 0xFFFFFFFF, true);
+            hit(L + panelW - foldW - 8 * sc, top, L + panelW, top + hh, 1);
+            if (!h.monOn) return;
+
+            float spd = h.spdDm / 10f;
+            int limK = h.limK;
+            float lim = limK > 0 ? limK / 3.6f : 0f;
+            int cWhite = 0xFFFFFFFF, cLabel = 0xFF93A7C2, cGreen = 0xFF38E07B, cWarn = 0xFFFFB020, cBad = 0xFFFF4A4A, cCard = 0xEB16243E;
+            int spdCol = cWhite, barCol = cGreen, railCol = 0xFF5C7AA8;
+            if (lim > 0) {
+                if (h.over != 0) spdCol = barCol = railCol = cBad;
+                else if (spd >= lim - 0.3f) spdCol = barCol = railCol = cWarn;
+            }
+            float pad = 6 * sc, cw = panelW - 2 * pad;
+            float y = top + hh + 4 * sc;
+            int spdK = (int) (spd * 3.6f + 0.5f);
+            if (h.compact) {
+                // speed + limit, next text, next signal / object
+                text(c, spdK + " km/h", L + pad + 4 * sc, y, fs + 2 * sc, spdCol, true, cw * 0.6f);
+                text(c, "Limit " + (limK > 0 ? limK + "" : "--"), L + pad + cw * 0.6f, y + 2 * sc, fsSmall, cLabel, false, cw * 0.4f);
+                y += rowH + 2 * sc;
+                text(c, f[14], L + pad + 4 * sc, y, fsSmall, col(f[15], cWhite), false, cw - 8 * sc);
+                y += rowH + 2 * sc;
+                signalStrip(c, h, L + pad + 4 * sc, y, cw - 8 * sc, rowH, fsSmall);
+                return;
+            }
+            text(c, f[13], L + pad + 2 * sc, y, fsSmall, cLabel, false, cw);
+            y += rowH + 1 * sc;
+
+            // speed card
+            float fsBig = fs * 2, bigH = fsBig + 6 * sc, spH = bigH + 12 * sc + rowH;
+            box(c, L + pad, y, cw, spH, cCard);
+            text(c, spdK + "", L + pad + 8 * sc, y + 1 * sc, fsBig, spdCol, true, cw / 2);
+            p.setTextSize(fsBig);
+            p.setFakeBoldText(true);
+            float sw = p.measureText(spdK + "");
+            text(c, "km/h", L + pad + 14 * sc + sw, y + bigH - rowH, fsSmall, cLabel, false, 0);
+            float bs = bigH - 4 * sc, bx = L + pad + cw - bs - 9 * sc;
+            box(c, bx - 3 * sc, y + 2 * sc, bs + 6 * sc, bs + 6 * sc, 0xFFD32F2F);
+            box(c, bx, y + 5 * sc, bs, bs, 0xFFF5F5F0);
+            textC(c, limK > 0 ? limK + "" : "--", bx, y + 5 * sc, bs, bs, fs + 2 * sc, 0xFF111111, true);
+            float barY = y + bigH + 5 * sc, barW = cw - 16 * sc;
+            float scaleMax = lim > 0 ? lim * 1.25f : 44.4f;
+            if (scaleMax < 8f) scaleMax = 8f;
+            float fillW = Math.min(barW, spd / scaleMax * barW);
+            box(c, L + pad + 8 * sc, barY, barW, 6 * sc, 0xFF2A3A58);
+            if (fillW > 0) box(c, L + pad + 8 * sc, barY, fillW, 6 * sc, barCol);
+            if (lim > 0) box(c, L + pad + 8 * sc + lim / scaleMax * barW - 1 * sc, barY - 3 * sc, 3 * sc, 12 * sc, cWhite);
+            text(c, "Projected  " + h.projK + " km/h", L + pad + 8 * sc, barY + 8 * sc, fsSmall, cLabel, false, cw - 16 * sc);
+            y += spH + 5 * sc;
+
+            // next card: next change / braking warning, next three signals, MAIN / LOOP
+            float nH = rowH * 2 + 8 * sc, badgeW = 0.34f * ppi;
+            box(c, L + pad, y, cw, nH, cCard);
+            text(c, f[14], L + pad + 8 * sc, y + 3 * sc, fsSmall, col(f[15], cWhite), false, cw - 14 * sc);
+            signalStrip(c, h, L + pad + 8 * sc, y + 4 * sc + rowH, cw - badgeW - 22 * sc, rowH, fsSmall);
+            String line = f[16];
+            if (line.length() > 0) {
+                int lc = line.equals("STOP") ? cBad : (line.equals("LOOP") ? cWarn : cGreen);
+                float bx2 = L + pad + cw - badgeW - 7 * sc;
+                box(c, bx2, y + 6 * sc + rowH, badgeW, rowH - 4 * sc, lc);
+                textC(c, line, bx2, y + 6 * sc + rowH, badgeW, rowH - 4 * sc, fsSmall, 0xFF0A1424, true);
+            }
+            y += nH + 5 * sc;
+
+            // gradient card
+            float gcH = rowH * 3 + 8 * sc;
+            box(c, L + pad, y, cw, gcH, cCard);
+            text(c, f[17], L + pad + 8 * sc, y + 3 * sc, fsSmall, col(f[18], cWhite), false, cw - 14 * sc);
+            float pfW = (cw - 16 * sc) * 0.64f, pfH = rowH * 2 - 2 * sc;
+            profile(c, h, L + pad + 8 * sc, y + 3 * sc + rowH, pfW, pfH);
+            text(c, "next 2 km", L + pad + 14 * sc + pfW, y + 3 * sc + rowH, fsSmall, cLabel, false, cw - pfW - 20 * sc);
+            text(c, f[19], L + pad + 14 * sc + pfW, y + 3 * sc + rowH * 2, fsSmall, cWhite, false, cw - pfW - 20 * sc);
+            y += gcH + 5 * sc;
+
+            // info card: station, trip (tap = reset), mode (tap = PHYS) [, rail line when the script sends one]
+            boolean railRow = f[23].length() > 0;
+            float icH = rowH * (railRow ? 4 : 3) + 8 * sc;
+            box(c, L + pad, y, cw, icH, cCard);
+            text(c, f[20], L + pad + 8 * sc, y + 3 * sc, fsSmall, 0xFF7FD3FF, false, cw - 14 * sc);
+            text(c, f[21], L + pad + 8 * sc, y + 3 * sc + rowH, fsSmall, cLabel, false, cw - 14 * sc);
+            hit(L + pad, y + 3 * sc + rowH, L + pad + cw, y + 3 * sc + rowH * 2, 21);
+            text(c, f[22], L + pad + 8 * sc, y + 3 * sc + rowH * 2, fsSmall, cGreen, false, cw - 14 * sc);
+            hit(L + pad, y + 3 * sc + rowH * 2, L + pad + cw, y + 3 * sc + rowH * 3, 4);
+            if (railRow) text(c, f[23], L + pad + 8 * sc, y + 3 * sc + rowH * 3, fsSmall, 0xFFFFD27F, false, cw - 14 * sc);
+            y += icH + 4 * sc;
+
+            lineDiagram(c, h, L, y, panelW, top + panelH, fs, fsSmall, rowH, ppi, railCol, lim);
+        }
+
+        /** distance of an object now: its distance at the scan minus what the train ran since */
+        float objDist(Hud h, int[] o) {
+            float run = h.trav;                    // metres run since the script's scan of the line
+            if (run < 0) run = 0;
+            float d = o[2];
+            int want = h.rev != 0 ? -1 : 1;
+            if (o[1] == want) d -= run;
+            else d += run;
+            return Math.max(0f, d);
+        }
+
+        void signalStrip(Canvas c, Hud h, float x, float y, float w, float rh, float fsSmall) {
+            int want = h.rev != 0 ? -1 : 1;
+            float slotW = w / 3, dot = Math.max(6 * sc, rh - 6 * sc);
+            int shown = 0;
+            for (int[] o : h.obj) {
+                if (shown >= 3) break;
+                if (o[0] != 0 || o[1] != want) continue;
+                float d = objDist(h, o);
+                float qd = (int) (d / 25f + 0.5f) * 25f;
+                float sx = x + shown * slotW, sy = y + 3 * sc;
+                box(c, sx, sy - 1 * sc, dot + 2 * sc, dot + 2 * sc, 0xFF000000);
+                int lvl = o[5];
+                if (lvl == 2) {
+                    float half = dot / 2 - 1 * sc;
+                    box(c, sx + 1 * sc, sy, dot, half, 0xFFFFBE1E);
+                    box(c, sx + 1 * sc, sy + dot - half, dot, half, 0xFFFFBE1E);
+                } else {
+                    box(c, sx + 1 * sc, sy, dot, dot, lvl == 0 ? 0xFFFF2A1E : (lvl == 3 ? 0xFF28EB78 : 0xFFFFBE1E));
+                }
+                text(c, dist(qd), sx + dot + 5 * sc, y, fsSmall, 0xFFFFFFFF, false, slotW - dot - 6 * sc);
+                shown++;
+            }
+            if (shown == 0) text(c, "No signal ahead", x, y, fsSmall, 0xFF8FA596, false, w);
+        }
+
+        void profile(Canvas c, Hud h, float x, float y, float w, float ph) {
+            box(c, x, y, w, ph, 0xFF0C1A30);
+            int[] pf = h.prof;
+            if (pf == null || pf.length < 2 || pf[0] == Integer.MIN_VALUE) return;
+            int cols = Math.min(20, pf.length - 1);
+            float cw = Math.max(2 * sc, (int) (w / 20));
+            float here = pf[0] / 10f, lo = here, hi = here;
+            for (int i = 1; i <= cols; i++) {
+                if (pf[i] == Integer.MIN_VALUE) continue;
+                lo = Math.min(lo, pf[i] / 10f);
+                hi = Math.max(hi, pf[i] / 10f);
+            }
+            float range = hi - lo;
+            if (range < 6f) {
+                lo -= (6f - range) / 2f;
+                range = 6f;
+            }
+            float bottom = y + ph - 1 * sc, ah = ph - 4 * sc;
+            float prev = here;
+            for (int i = 1; i <= cols; i++) {
+                if (pf[i] == Integer.MIN_VALUE) break;
+                float hv = pf[i] / 10f;
+                float bh = 2 * sc + (hv - lo) / range * (ah - 2 * sc);
+                float slope = (hv - prev) / 100f * 100f;
+                int bc = slope > 0.15f ? 0xFFE8C030 : (slope < -0.15f ? 0xFF4AA8E8 : 0xFF3CC070);
+                prev = hv;
+                box(c, x + (i - 1) * cw, bottom - bh, cw - 1 * sc, bh, bc);
+            }
+            float hy = bottom - 2 * sc - (here - lo) / range * (ah - 2 * sc);
+            box(c, x, hy, cols * cw, 1 * sc, 0xFFFFFFFF);
+            box(c, x, y, 2 * sc, ph, 0xFFFFFFFF);
+        }
+
+        void signalHead(Canvas c, float x, float y, float w, float hgt, int level) {
+            box(c, x, y, w, hgt, 0xFFF0F0EA);
+            box(c, x + 2 * sc, y + 2 * sc, w - 4 * sc, hgt - 4 * sc, 0xFF0A0A0C);
+            float step = (hgt - 8 * sc) / 4;
+            float lamp = Math.max(3 * sc, Math.min(w - 8 * sc, step - 2 * sc));
+            float lx = x + (w - lamp) / 2;
+            for (int k = 0; k < 4; k++) {
+                int cl = 0xFF3A2A08;
+                if (k == 0 && level == 2) cl = 0xFFFFBE1E;
+                if (k == 1) cl = level == 3 ? 0xFF28EB78 : 0xFF0A3A1C;
+                if (k == 2 && (level == 1 || level == 2)) cl = 0xFFFFBE1E;
+                if (k == 3) cl = level == 0 ? 0xFFFF2A1E : 0xFF3A0A08;
+                p.setStyle(Paint.Style.FILL);
+                p.setColor(cl);
+                c.drawCircle(lx + lamp / 2, y + 4 * sc + k * step + step / 2, lamp / 2, p);
+            }
+        }
+
+        void lineDiagram(Canvas c, Hud h, float L, float y, float panelW, float panelBottom, float fs, float fsSmall,
+                         float rowH, float ppi, int railCol, float lim) {
+            float distW = 0.34f * ppi, sigX = L + distW, iconW = 0.09f * ppi, iconH = 0.20f * ppi;
+            float rail1X = sigX + iconW + 6 * sc, rail2X = rail1X + 0.05f * ppi, ptsX = rail2X + 6 * sc;
+            float spdX = ptsX + 0.10f * ppi, spdW = L + panelW - spdX - 3 * sc;
+            int cLabel = 0xFF93A7C2, cWhite = 0xFFFFFFFF;
+            text(c, "Dist", L + 4 * sc, y, fsSmall, cLabel, false, 0);
+            text(c, "Limit", spdX, y, fsSmall, cLabel, false, 0);
+            y += rowH;
+            float gTop = y + iconH / 2, gBot = panelBottom - iconH / 2 - 4 * sc, gH = gBot - gTop;
+            if (gH <= 40 * sc) return;
+            float trainH = 0.16f * ppi, trainY = gTop + gH * 0.64f;
+            float fwdScale = (trainY - gTop) / 3000f, backScale = (gBot - (trainY + trainH)) / 1500f;
+            box(c, rail1X, gTop, 2 * sc, gH, railCol);
+            box(c, rail2X, gTop, 2 * sc, gH, railCol);
+            float[][] marks = {{500, 1}, {1000, 1}, {2000, 1}, {500, -1}, {1000, -1}};
+            for (float[] m : marks) {
+                float my = m[1] > 0 ? trainY - m[0] * fwdScale : trainY + trainH + m[0] * backScale;
+                box(c, rail1X - 6 * sc, my, rail2X - rail1X + 14 * sc, 1 * sc, 0xFF2A3A56);
+            }
+            float trainX = rail1X - 4 * sc, trainW = rail2X - rail1X + 10 * sc;
+            box(c, trainX, trainY, trainW, trainH, 0xFFFF8A1E);
+            float capY = h.rev != 0 ? trainY + trainH - 2 * sc - trainH / 4 : trainY + 2 * sc;
+            box(c, trainX + 2 * sc, capY, trainW - 4 * sc, trainH / 4, cWhite);
+            float lastAhead = trainY, lastBehind = trainY + trainH;
+            boolean shownSpeed = false;
+            int ahead = h.rev != 0 ? -1 : 1;
+            for (int[] o : h.obj) {
+                float qd = (int) (objDist(h, o) / 25f + 0.5f) * 25f;
+                float iy;
+                if (o[1] == ahead) {
+                    iy = trainY - qd * fwdScale - iconH / 2;
+                    if (iy > lastAhead - iconH) iy = lastAhead - iconH;
+                    if (iy < gTop - iconH / 2) continue;
+                    lastAhead = iy;
+                } else {
+                    iy = trainY + trainH + qd * backScale - iconH / 2;
+                    if (iy < lastBehind) iy = lastBehind;
+                    if (iy + iconH > gBot + iconH / 2) continue;
+                    lastBehind = iy + iconH;
+                }
+                float midY = iy + iconH / 2 - rowH / 2;
+                String dt = dist(qd);
+                int k = o[0];
+                if (k == 0) {
+                    signalHead(c, sigX, iy, iconW, iconH, o[5]);
+                    text(c, dt, L + 4 * sc, midY, fsSmall, cWhite, false, distW - 4 * sc);
+                    if (o[6] != 0) {
+                        box(c, spdX, iy, spdW, rowH, 0xFF38E07B);
+                        text(c, o[6] < 0 ? "<LOOP" : "LOOP>", spdX + 2 * sc, iy + 1 * sc, fsSmall, 0xFF000000, false, spdW - 3 * sc);
+                    }
+                    if (o[4] > 0) text(c, o[4] + "", spdX, iy + rowH, fs, 0xFFFFE040, false, spdW);
+                } else if (k == 4 || k == 5) {
+                    int oc = k == 5 ? 0xFFFF9030 : 0xFFFF5050;
+                    box(c, rail1X - 6 * sc, midY + rowH / 2 - 2 * sc, rail2X - rail1X + 14 * sc, 4 * sc, oc);
+                    text(c, k == 5 ? "END" : "TRAIN", ptsX, midY, fsSmall, oc, false, L + panelW - ptsX - 3 * sc);
+                    text(c, dt, L + 4 * sc, midY, fsSmall, oc, false, distW - 4 * sc);
+                } else if (k == 1) {
+                    int pc = (lim > 0 && o[3] < (int) (lim * 3.6f + 0.5f)) ? 0xFFFFE040 : cWhite;
+                    text(c, o[3] + "", spdX, midY, fs, pc, false, spdW);
+                    if (!shownSpeed) text(c, dt, L + 4 * sc, midY, fsSmall, pc, false, distW - 4 * sc);
+                    shownSpeed = true;
+                } else {
+                    // points: Junction.DIRECTION_LEFT = 0, DIRECTION_RIGHT = 2 (straight / unknown = |)
+                    String pt = o[3] == 0 ? "<" : (o[3] == 2 ? ">" : "|");
+                    text(c, pt, ptsX, midY, fs, k == 3 ? 0xFF5A6A85 : cWhite, false, spdX - ptsX);
+                    if (k == 2) text(c, dt, L + 4 * sc, midY, fsSmall, 0xFFB0C4CC, false, distW - 4 * sc);
+                }
+            }
+        }
+
+        static final String[] LIGHT_NAME = {"Headlights", "High beam", "Marker lights", "Marker front", "Marker back",
+                "Flasher front", "Flasher back", "Emergency flasher"};
+        static final int[] LIGHT_CMD = {10, 17, 11, 12, 13, 14, 15, 16};
+        static final int[] ROW_FIELD = {0, 1, -1, 2, 3, 4, 5, 6};     // TTSHL field of each row (-1 = both markers)
+
+        void drawLights(Canvas c, Hud h, int side, float ppi, float fs, float fsSmall, float rowH, float W, float Hh) {
+            float step = rowH + 16 * sc, panelW = 0.95f * ppi;
+            float panelH = h.lightsOn ? rowH + 14 * sc + 8 * step + 3 * rowH + 6 * sc : rowH + 8 * sc;
+            float top = Hh * 0.30f;
+            if (top + panelH > Hh - 0.6f * ppi) top = Hh - 0.6f * ppi - panelH;
+            if (top < 40 * sc) top = 40 * sc;
+            float L = side == 0 ? W - panelW - 4 * sc : 4 * sc;
+            if (h.lightsOn) box(c, L, top, panelW, panelH, 0xE60A1424);
+            box(c, L, top, panelW, rowH + 4 * sc, 0xF412284A);
+            box(c, L, top, 4 * sc, rowH + 4 * sc, 0xFFFF8A1E);
+            text(c, "LIGHTS  " + (h.lightsOn ? "[-]" : "[+]"), L + 8 * sc, top + 3 * sc, fs, 0xFFFFB733, false, panelW - 12 * sc);
+            hit(L, top, L + panelW, top + rowH + 4 * sc, 6);
+            if (!h.lightsOn) return;
+            float y = top + rowH + 10 * sc;
+            for (int i = 0; i < 8; i++) {
+                boolean on = ROW_FIELD[i] < 0 ? (h.light(2) && h.light(3)) : h.light(ROW_FIELD[i]);
+                float rh = step - 4 * sc;
+                box(c, L + 6 * sc, y, panelW - 12 * sc, rh, on ? 0xF0143C28 : 0xF0162440);
+                box(c, L + 6 * sc, y, 4 * sc, rh, on ? 0xFF38E07B : 0xFF3A4A66);
+                text(c, LIGHT_NAME[i], L + 16 * sc, y + (rh - fs) / 2, fs * 0.92f, on ? 0xFFFFFFFF : 0xFFB8C4D6, false, panelW - 0.30f * ppi);
+                float sw = 0.20f * ppi, sh = rh * 0.52f, sx = L + panelW - sw - 12 * sc, sy = y + (rh - sh) / 2;
+                p.setStyle(Paint.Style.FILL);
+                p.setColor(on ? 0xFF38E07B : 0xFF46546E);
+                r.set(sx, sy, sx + sw, sy + sh);
+                c.drawRoundRect(r, sh / 2, sh / 2, p);
+                p.setColor(0xFFFFFFFF);
+                c.drawCircle(on ? sx + sw - sh / 2 : sx + sh / 2, sy + sh / 2, sh / 2 - 2 * sc, p);
+                hit(L, y, L + panelW, y + rh, LIGHT_CMD[i]);
+                y += step;
+            }
+            y += 4 * sc;
+            String[] lf = h.lights;
+            text(c, lf != null ? lf[8] : "", L + 6 * sc, y, fsSmall, 0xFF93A7C2, false, panelW - 12 * sc);
+            text(c, "Each light works on its own", L + 6 * sc, y + rowH, fsSmall, 0xFF46584C, false, panelW - 12 * sc);
+        }
+    }
+
+    // ================================================================ r126: CPU boost for the game's busiest threads
+    /**
+     * The lag is the emulated engine itself: one or two threads (the emulated CPU core, the GL thread) run at
+     * 90-100 % of a core.  Every 2 s this looks at how busy every thread of the game is (/proc/self/task) and
+     * gives the busiest ones (over 35 % of a core, at most 4) a higher scheduler priority; on Android 12+ they
+     * also get a performance-hint session (ADPF) that asks the phone for higher CPU clocks while they are
+     * saturated (over 85 %), and lets the clocks fall again when they are not.  Our own threads are left alone.
+     * Stops while the game is in the background.
+     */
+    static final Boost boost = new Boost();
+
+    static final class Boost implements Runnable {
+        static final long TARGET_NS = 16666666L;
+        Thread th;
+        volatile boolean run;
+        final HashMap<Integer, Long> lastTicks = new HashMap<Integer, Long>();
+        long lastT;
+        int[] picks = new int[0];
+        float busy;
+        final java.util.HashSet<Integer> raised = new java.util.HashSet<Integer>();
+        Object session;
+        Method report, close;
+        boolean adpfFailed;
+        int logged;
+
+        synchronized void start() {
+            run = true;
+            if (th != null && th.isAlive()) return;
+            th = new Thread(this, "TTSBoost");
+            th.setDaemon(true);
+            th.start();
+        }
+
+        void stop() {
+            run = false;
+        }
+
+        public void run() {
+            int n = 0;
+            while (run) {
+                try {
+                    if (n % 20 == 0) scan();
+                    hint();
+                } catch (Throwable t) {
+                    if (logged++ < 5) log("boost: " + t);
+                }
+                n++;
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException e) {
+                    break;
+                }
+            }
+            endSession();
+        }
+
+        /** CPU ticks (user + system) of a thread, or -1; skips our own TTS* threads */
+        static long ticks(File task) {
+            try {
+                File stat = new File(task, "stat");
+                FileInputStream in = new FileInputStream(stat);
+                byte[] b = new byte[512];
+                int len;
+                try {
+                    len = in.read(b);
+                } finally {
+                    in.close();
+                }
+                if (len <= 0) return -1;
+                String s = new String(b, 0, len, "ISO-8859-1");
+                int o = s.indexOf('('), c = s.lastIndexOf(')');
+                if (o < 0 || c < 0) return -1;
+                if (s.substring(o + 1, c).startsWith("TTS")) return -1;
+                String[] f = s.substring(c + 2).trim().split(" ");
+                if (f.length < 13) return -1;
+                return Long.parseLong(f[11]) + Long.parseLong(f[12]);
+            } catch (Throwable t) {
+                return -1;
+            }
+        }
+
+        void scan() {
+            File[] tasks = new File("/proc/self/task").listFiles();
+            if (tasks == null) return;
+            long now = System.nanoTime();
+            float dt = lastT == 0 ? 0f : (now - lastT) / 1e9f;
+            lastT = now;
+            HashMap<Integer, Long> cur = new HashMap<Integer, Long>();
+            java.util.ArrayList<float[]> use = new java.util.ArrayList<float[]>();
+            for (File t : tasks) {
+                int tid;
+                try {
+                    tid = Integer.parseInt(t.getName());
+                } catch (NumberFormatException e) {
+                    continue;
+                }
+                long k = ticks(t);
+                if (k < 0) continue;
+                cur.put(tid, k);
+                Long was = lastTicks.get(tid);
+                if (was != null && dt > 0.5f) use.add(new float[]{tid, (k - was) / 100f / dt});
+            }
+            lastTicks.clear();
+            lastTicks.putAll(cur);
+            if (use.isEmpty()) return;
+            java.util.Collections.sort(use, new java.util.Comparator<float[]>() {
+                public int compare(float[] a, float[] b) {
+                    return Float.compare(b[1], a[1]);
+                }
+            });
+            java.util.ArrayList<Integer> pick = new java.util.ArrayList<Integer>();
+            float top = 0f;
+            for (float[] u : use) {
+                if (pick.size() >= 4 || u[1] < 0.35f) break;
+                pick.add((int) u[0]);
+                top = Math.max(top, u[1]);
+            }
+            busy = top;
+            for (int tid : pick) {
+                if (raised.contains(tid)) continue;
+                try {
+                    android.os.Process.setThreadPriority(tid, -10);
+                    raised.add(tid);
+                    if (logged++ < 20) log("boost: thread " + tid + " priority -10");
+                } catch (Throwable e) {
+                    if (logged++ < 20) log("boost: priority " + tid + ": " + e);
+                }
+            }
+            raised.retainAll(cur.keySet());
+            int[] p = new int[pick.size()];
+            for (int i = 0; i < p.length; i++) p[i] = pick.get(i);
+            java.util.Arrays.sort(p);
+            if (!java.util.Arrays.equals(p, picks)) {
+                picks = p;
+                endSession();
+                startSession();
+            }
+        }
+
+        void startSession() {
+            if (adpfFailed || picks.length == 0 || android.os.Build.VERSION.SDK_INT < 31 || app == null) return;
+            try {
+                Object mgr = app.getSystemService("performance_hint");
+                if (mgr == null) {
+                    adpfFailed = true;
+                    return;
+                }
+                Method create = mgr.getClass().getMethod("createHintSession", int[].class, long.class);
+                session = create.invoke(mgr, picks, TARGET_NS);
+                if (session == null) return;
+                report = session.getClass().getMethod("reportActualWorkDuration", long.class);
+                close = session.getClass().getMethod("close");
+                if (logged++ < 20) log("boost: hint session for " + picks.length + " threads");
+            } catch (Throwable e) {
+                adpfFailed = true;
+                session = null;
+                log("boost: no hint session: " + e);
+            }
+        }
+
+        void endSession() {
+            Object s = session;
+            session = null;
+            if (s == null || close == null) return;
+            try {
+                close.invoke(s);
+            } catch (Throwable e) {
+                // gone already
+            }
+        }
+
+        void hint() {
+            Object s = session;
+            if (s == null || report == null) return;
+            try {
+                // saturated: "the work took longer than the target" -> the phone raises the clocks
+                long actual = busy > 0.85f ? TARGET_NS * 3 / 2 : TARGET_NS * 9 / 10;
+                report.invoke(s, actual);
+            } catch (Throwable e) {
+                endSession();
+            }
+        }
+    }
+
     // ================================================================ touch router
     /**
      * The game reads touches in its Activity.onTouchEvent, which only runs when no view takes the
@@ -1556,6 +2549,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
     static final class Router implements InvocationHandler {
         final Window.Callback orig;
         int padId = -1;            // pointer id held by the pad
+        boolean hudTouch;          // r126: this gesture is a tap on the HUD
         long gameDown;             // down time of the game's own part of the gesture
 
         Router(Window.Callback o) {
@@ -1588,6 +2582,18 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             PadView p = pad;
             int act = ev.getActionMasked();
             int ai = ev.getActionIndex();
+            // r126: HUD panels take a whole one-finger gesture (the game never sees it)
+            HudView hv = hud.view;
+            if (act == MotionEvent.ACTION_DOWN && padId < 0) hudTouch = hv != null && hv.claim(ev.getX(), ev.getY());
+            if (hudTouch) {
+                if (act == MotionEvent.ACTION_UP) {
+                    hudTouch = false;
+                    if (hv != null) hv.tap(ev.getX(), ev.getY());
+                } else if (act == MotionEvent.ACTION_CANCEL) {
+                    hudTouch = false;
+                }
+                return true;
+            }
             if (act == MotionEvent.ACTION_DOWN) {
                 if (padId >= 0 && p != null) p.lift(true);
                 padId = -1;
