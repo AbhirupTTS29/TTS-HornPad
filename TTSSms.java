@@ -61,6 +61,9 @@ public final class TTSSms {
     static AudioTrack track;
     static String loadedKuid;
     static volatile Engine eng;                  // the loaded sound set (null = nothing)
+    static volatile Engine[] trk = new Engine[0]; // r139: the track sounds (.sms of the tracksound assets of the bogeys, one per kind), play with eng
+    static String trkLine = "";                  // last TTSTRK line handled
+    static long trkTry;                          // when a track sound that could not be found was tried
 
     static long testNs = -1;          // host test: a virtual clock (and no audio thread)
 
@@ -79,6 +82,7 @@ public final class TTSSms {
     // ------------------------------------------------------------------ Trainz.log lines from the HUD
     /** called by the TTSHornPad watcher with every new piece of Trainz.log */
     static void fromLog(String s, File base, TTSHornPad.Watcher w) {
+        trackFromLog(s, w);
         int i = s.lastIndexOf("TTSSMS: ");
         int done = s.lastIndexOf("GSRouter::Done()");
         if (done > i) {
@@ -263,6 +267,51 @@ public final class TTSSms {
         }
     }
 
+    /** r139: "TTSTRK: <track-sound kuid> [<kuid> ...]" (the bogeys of the train) -> the first one with a .sms plays */
+    static void trackFromLog(String s, TTSHornPad.Watcher w) {
+        try {
+            int i = s.lastIndexOf("TTSTRK: ");
+            if (i < 0) return;
+            int e = s.indexOf('\n', i);
+            if (e < 0) e = s.length();
+            String line = s.substring(i + 8, e).trim();
+            long now = System.currentTimeMillis();
+            boolean same = line.equals(trkLine);
+            if (same && (trk.length > 0 || line.equals("none") || now - trkTry < 20000)) return;
+            trkLine = line;
+            trkTry = now;
+            if (line.equals("none") || line.length() == 0 || w == null) {
+                trk = new Engine[0];
+                return;
+            }
+            ArrayList<Engine> list = new ArrayList<Engine>();
+            ArrayList<String> seen = new ArrayList<String>();
+            StringBuilder what = new StringBuilder();
+            for (String q : line.split("\\s+")) {
+                String k = TTSHornPad.Watcher.normKuid(q);
+                if (k.length() == 0 || seen.contains(k)) continue;
+                seen.add(k);
+                File dir = w.findDir(k);
+                if (dir != null && dir.isDirectory()) {
+                    Engine en = Engine.open(dir);
+                    if (en != null) {
+                        list.add(en);
+                        what.append(' ').append(k).append(" streams=").append(en.streamCount());
+                    }
+                }
+            }
+            if (!list.isEmpty() || !same) TTSHornPad.log("sms track " + line + " -> " + (list.isEmpty() ? "(no .sms)" : what.toString().trim()));
+            trk = list.toArray(new Engine[0]);
+            if (!list.isEmpty()) {
+                synchronized (in) {
+                    in.notifyAll();
+                }
+            }
+        } catch (Throwable t) {
+            TTSHornPad.log("sms track: " + t);
+        }
+    }
+
     static boolean active() {
         return running && eng != null;
     }
@@ -285,6 +334,7 @@ public final class TTSSms {
             // keep normal
         }
         float[] acc = new float[CHUNK];
+        float[] acc2 = new float[CHUNK];
         float[] lim = new float[CHUNK];
         Limiter limiter = new Limiter();
         short[] out = new short[CHUNK * 2];
@@ -295,9 +345,10 @@ public final class TTSSms {
                     needReset = false;
                     Engine r = eng;
                     if (r != null) r.reset();
+                    for (Engine rt : trk) rt.reset();
                 }
                 synchronized (in) {
-                    while (!running || paused || eng == null) {
+                    while (!running || paused || (eng == null && trk.length == 0)) {
                         if (track != null) {
                             try {
                                 track.pause();
@@ -310,13 +361,20 @@ public final class TTSSms {
                     }
                 }
                 Engine e = eng;
-                if (e == null) continue;
+                Engine[] tks = trk;
+                if (e == null && tks.length == 0) continue;
                 if (tick <= 0) {
-                    e.control(now());
+                    int[] evs = e != null ? e.control(now(), null) : null;
+                    for (Engine tk : tks) tk.control(now(), evs);
                     tick += UPDATE_S;
                 }
                 tick -= (double) CHUNK / RATE;
-                e.render(acc, CHUNK);
+                if (e != null) e.render(acc, CHUNK);
+                else Arrays.fill(acc, 0f);
+                for (Engine tk : tks) {
+                    tk.render(acc2, CHUNK);
+                    for (int i = 0; i < CHUNK; i++) acc[i] += acc2[i];
+                }
                 limiter.run(acc, lim);
                 for (int i = 0; i < CHUNK; i++) {
                     short sv = pcm16(lim[i]);
@@ -496,7 +554,7 @@ public final class TTSSms {
         }
 
         /** one run of the Open Rails sound process */
-        void control(long now) {
+        int[] control(long now, int[] share) {
             double dt = lastNs == 0 ? UPDATE_S : (now - lastNs) / 1e9;
             if (dt > 0.2) dt = 0.2;
             lastNs = now;
@@ -512,10 +570,13 @@ public final class TTSSms {
                 vars.v1 = inT * 100f;
                 vars.v3 = inB;
                 vars.curveForce = inCF;
-                int n = evH - evT;
-                evs = new int[n];
-                for (int i = 0; i < n; i++) evs[i] = evq[(evT + i) & 63];
-                evT = evH;
+                if (share != null) evs = share;
+                else {
+                    int n = evH - evT;
+                    evs = new int[n];
+                    for (int i = 0; i < n; i++) evs[i] = evq[(evT + i) & 63];
+                    evT = evH;
+                }
             }
             // a loco whose force numbers cannot be read (still 0 with the throttle open): the throttle stands in
             if (thr > 0.05f && f < 0.002f) fZero += dt;
@@ -547,6 +608,7 @@ public final class TTSSms {
             for (int ev : evs)
                 for (Source s : sources) s.handleEvent(ev);
             for (Source s : sources) s.update(this);
+            return evs;
         }
 
         final Vars vars = new Vars();
