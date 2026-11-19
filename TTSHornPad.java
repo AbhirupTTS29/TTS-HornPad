@@ -91,6 +91,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
     public void onActivityResumed(Activity a) {
         try {
             if (!GAME.equals(a.getClass().getName())) return;
+            if (!TTSGate.check(a)) return;                 // login gate: the game stays shut until an approved login
             if (owner != a || hud.view == null || hud.view.getParent() == null) {
                 hud.loadPrefs(a);
                 HudView hv = new HudView(a);
