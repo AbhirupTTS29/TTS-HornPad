@@ -63,6 +63,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
     static final Mixer mixer = new Mixer();
     static final Watcher watcher = new Watcher();
     static final Weather weather = new Weather();
+    static final Hiss hiss = new Hiss();           // r143: air brake hiss
 
     // ---------------------------------------------------------------- provider plumbing
     @Override
@@ -113,6 +114,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             installRouter(a);
             watcher.start(a);
             weather.setPaused(false);
+            hiss.setPaused(false);
             TTSSms.setPaused(false);
             hud.resume();
             boost.start();
@@ -127,6 +129,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             if (a == owner) {
                 mixer.stopAll();
                 weather.setPaused(true);
+                hiss.setPaused(true);
                 TTSSms.setPaused(true);
                 hud.pause();
                 boost.stop();
@@ -275,6 +278,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             pos += end;
             String s = new String(buf, 0, end, "ISO-8859-1");
             weatherFromLog(s);
+            brakeFromLog(s);
             hud.fromLog(s);
             camFromLog(s);
             TTSSms.fromLog(s, base, this);              // r136: Open Rails .sms engine sound
@@ -363,6 +367,20 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         }
 
         /** rain level from the TTS weather commands of the HUD script ("TTSCMD:rain=N"); session end = dry */
+        /** r143: "TTSBRK: a <lag x10>" (brake applied) / "TTSBRK: r" (released) from the HUD script -> air brake hiss */
+        static void brakeFromLog(String s) {
+            int i = 0;
+            while (true) {
+                i = s.indexOf("TTSBRK: ", i);
+                if (i < 0) return;
+                i += 8;
+                if (i >= s.length()) return;
+                char c = s.charAt(i);
+                if (c == 'a') hiss.play(1);
+                else if (c == 'r') hiss.play(2);
+            }
+        }
+
         static void weatherFromLog(String s) {
             int r = s.lastIndexOf("TTSCMD:rain=");
             int done = s.lastIndexOf("GSRouter::Done()");
@@ -1332,6 +1350,129 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
      * while it storms.  Levels follow the TTS weather of the driver session (TTSCMD:rain=N from the HUD script):
      *   0 dry, 1 rain, 2 heavy rain, 3 thunderstorm, 4 drizzle.
      */
+    /** r143: the air brake of an Indian coach: a sharp "pssh" while the brake valve opens (apply), a longer, softer
+     *  "pshhhh" with a last puff when the brake lets go.  Made from filtered noise, own AudioTrack. */
+    static final class Hiss implements Runnable {
+        Thread th;
+        AudioTrack track;
+        final java.util.Random rnd = new java.util.Random();
+        volatile int kind;                 // 0 idle, 1 apply, 2 release
+        volatile boolean paused;
+        int pos, len;
+        float gain = 1f;
+        float hp1, hp1x, lp1, lp2, lp3;
+
+        synchronized void play(int k) {
+            float d = TTSHornPad.camD;
+            int ci = TTSHornPad.camIn;
+            if (d < 0f) d = 5f;
+            // in the cab the valve is right there, in a coach it comes through the body, outside it carries only a little
+            float g = ci == 1 ? 1f : ci == 2 ? 0.55f : Math.min(1f, 14f / Math.max(d, 14f)) * 0.8f;
+            if (g < 0.02f) return;
+            gain = g;
+            kind = k;
+            pos = 0;
+            len = (int) (RATE * (k == 1 ? 2.3f : 3.8f));
+            hp1 = hp1x = lp1 = lp2 = lp3 = 0f;
+            if (th == null || !th.isAlive()) {
+                th = new Thread(this, "TTSHiss");
+                th.setDaemon(true);
+                th.start();
+            }
+            notifyAll();
+        }
+
+        synchronized void setPaused(boolean p) {
+            paused = p;
+            notifyAll();
+        }
+
+        public void run() {
+            try {
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
+            } catch (Throwable t) {
+                // keep
+            }
+            final int chunk = 512;
+            short[] out = new short[chunk * 2];
+            while (true) {
+                try {
+                    synchronized (this) {
+                        while (paused || kind == 0) {
+                            if (track != null) {
+                                try {
+                                    track.pause();
+                                    track.flush();
+                                } catch (Throwable t) {
+                                    // ignore
+                                }
+                            }
+                            wait();
+                        }
+                    }
+                    render(out, chunk);
+                    if (track == null) track = Mixer.newTrack();
+                    if (track == null) {
+                        Thread.sleep(500);
+                        continue;
+                    }
+                    if (track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING) track.play();
+                    track.write(out, 0, out.length);
+                } catch (Throwable t) {
+                    TTSHornPad.log("hiss audio: " + t);
+                    try {
+                        if (track != null) track.release();
+                    } catch (Throwable t2) {
+                        // ignore
+                    }
+                    track = null;
+                    try {
+                        Thread.sleep(500);
+                    } catch (InterruptedException e) {
+                        return;
+                    }
+                }
+            }
+        }
+
+        void render(short[] out, int chunk) {
+            int k = kind;
+            for (int i = 0; i < chunk; i++) {
+                float v = 0f;
+                if (k != 0 && pos < len) {
+                    float t = pos / (float) RATE;
+                    float env;
+                    if (k == 1) {
+                        // apply: opens fast, falls away in ~2 s, a small second puff as the valve shuts
+                        env = (1f - (float) Math.exp(-t / 0.015f)) * (float) Math.exp(-t / 0.75f);
+                        env += 0.18f * (float) Math.exp(-(t - 1.5f) * (t - 1.5f) / 0.06f);
+                    } else {
+                        // release: swells, long soft exhaust, a last short puff
+                        env = (1f - (float) Math.exp(-t / 0.12f)) * (float) Math.exp(-t / 1.35f);
+                        env += 0.22f * (float) Math.exp(-(t - 2.7f) * (t - 2.7f) / 0.05f);
+                    }
+                    float w = rnd.nextFloat() * 2f - 1f;
+                    // band: ~1.3 kHz up to ~4 kHz (air escaping through a small hole), a little body at ~600 Hz
+                    hp1 = 0.82f * (hp1 + w - hp1x);
+                    hp1x = w;
+                    lp1 += (hp1 - lp1) * 0.30f;
+                    lp2 += (w - lp2) * 0.07f;
+                    lp3 += (lp2 - lp3) * 0.07f;
+                    float n = lp1 * (k == 1 ? 1.0f : 0.8f) + lp3 * (k == 1 ? 1.4f : 2.0f);
+                    v = n * env * 0.8f * gain;
+                    pos++;
+                } else if (k != 0) {
+                    kind = 0;
+                    k = 0;
+                }
+                v = v / (1f + Math.abs(v)) * 1.5f;
+                short sv = clip(v);
+                out[2 * i] = sv;
+                out[2 * i + 1] = sv;
+            }
+        }
+    }
+
     static final class Weather implements Runnable {
         volatile int rain;
         volatile boolean paused;
