@@ -113,6 +113,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             installRouter(a);
             watcher.start(a);
             weather.setPaused(false);
+            TTSSms.setPaused(false);
             hud.resume();
             boost.start();
         } catch (Throwable t) {
@@ -126,6 +127,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             if (a == owner) {
                 mixer.stopAll();
                 weather.setPaused(true);
+                TTSSms.setPaused(true);
                 hud.pause();
                 boost.stop();
                 if (pad != null) pad.dropTouch();
@@ -141,6 +143,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             if (a == owner) {
                 mixer.stopAll();
                 weather.setRain(0);
+                TTSSms.stop();
                 hud.pause();
                 boost.stop();
                 hud.view = null;
@@ -216,7 +219,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                     log("poll: " + t);
                 }
                 try {
-                    Thread.sleep(hud.active ? 100 : 300);
+                    Thread.sleep(hud.active || TTSSms.active() ? 100 : 300);
                 } catch (InterruptedException e) {
                     return;
                 }
@@ -274,6 +277,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             weatherFromLog(s);
             hud.fromLog(s);
             camFromLog(s);
+            TTSSms.fromLog(s, base, this);              // r136: Open Rails .sms engine sound
             int i = s.lastIndexOf("TTSJOY: o");
             // the driver session ended (back to the menu, Surveyor / edit session): the game's script
             // router shuts down and the HUD script never gets to write "off" - hide the pad ourselves
