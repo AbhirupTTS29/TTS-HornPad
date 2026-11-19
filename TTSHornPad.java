@@ -1345,6 +1345,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         float tapL, tapR, tapLp, tapRp;
         float dropEnv, dropPan, dropY1, dropY2, dropA1, dropA2;
         float roar1, roar2;
+        float cabG = 1f, cabM = 0f, cfL, cfR;   // r142: rain heard from the cab / a coach: quieter and muffled
         float gust = 1f, gustT = 1f;
         int gustN;
         // thunder
@@ -1444,6 +1445,9 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 nextThunder = now + 12000 + rnd.nextInt(26000);
             }
             if (!storm && thPos < 0) nextThunder = 0;
+            int cin = TTSHornPad.camIn;
+            float cabTg = cin == 1 ? 0.30f : cin == 2 ? 0.40f : 1f;
+            float cabMt = cin == 1 ? 0.85f : cin == 2 ? 0.75f : 0f;
             for (int i = 0; i < chunk; i++) {
                 level += (tgt - level) * (1f / (RATE * 2.5f));      // rain swells / dies away over a few seconds
                 if (--gustN <= 0) {                                  // gusts: the rain comes in waves
@@ -1478,7 +1482,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 float roar = roar2 * 6f * Math.max(0f, level - 0.5f) * 2f;
                 L += roar;
                 R += roar;
-                float g = level * 0.65f * gust;
+                float g = level * 0.42f * gust;              // r142: was 0.65 (too loud)
                 L *= g;
                 R *= g;
                 if (thPos >= 0) {
@@ -1488,6 +1492,13 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                         R += t;
                     } else thPos = -1;
                 }
+                // r142: in the cab (and a coach) the outside rain comes through the body: lower and dull, as in Trainz
+                cabG += (cabTg - cabG) * (1f / (RATE * 0.35f));
+                cabM += (cabMt - cabM) * (1f / (RATE * 0.35f));
+                cfL += (L - cfL) * 0.10f;                 // ~700 Hz low-pass
+                cfR += (R - cfR) * 0.10f;
+                L = (L * (1f - cabM) + cfL * cabM) * cabG;
+                R = (R * (1f - cabM) + cfR * cabM) * cabG;
                 // soft limit (a loud thunder clap must not crackle)
                 L = L / (1f + Math.abs(L) * 0.5f) * 1.25f;
                 R = R / (1f + Math.abs(R) * 0.5f) * 1.25f;
