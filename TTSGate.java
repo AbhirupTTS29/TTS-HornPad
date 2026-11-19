@@ -5,6 +5,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
+import android.net.Uri;
 import android.os.Bundle;
 import android.provider.Settings;
 import android.text.InputType;
@@ -25,9 +26,14 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.URLDecoder;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.security.MessageDigest;
+import java.security.SecureRandom;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
@@ -42,6 +48,9 @@ import javax.crypto.spec.SecretKeySpec;
  *  - After one successful online open the phone may start the game offline for GRACE_DAYS.  Whenever the
  *    phone is online at start, the account is re-checked in the background: if the developer has blocked
  *    it (or the binding no longer matches) the game is shut again at once.
+
+ *  - Login: "Sign in with Google" (system browser + loopback redirect + PKCE, exactly like TTS Forge) or
+ *    email + password.  Both end in the same Firebase account (uid) -> the same game_access/<uid> record.
  *  - Plain HTTPS to the Firebase REST API - no Google Play Services.  The Firebase project values are NOT
  *    in this source: they are read from the APK asset tts_gate.cfg (two lines: api key, project id).
  *
@@ -57,9 +66,11 @@ public final class TTSGate {
     static String AUTH_BASE = "https://identitytoolkit.googleapis.com";
     static String TOKEN_BASE = "https://securetoken.googleapis.com";
     static String FS_BASE = "https://firestore.googleapis.com";
+    static String GOOGLE_AUTH = "https://accounts.google.com/o/oauth2/v2/auth";
+    static String GOOGLE_TOKEN = "https://oauth2.googleapis.com/token";
     static boolean PATCH_VIA_POST = false;      // host test: the JDK's HttpURLConnection has no PATCH
 
-    static String fbKey = "", fbPid = "";       // from assets/tts_gate.cfg
+    static String fbKey = "", fbPid = "", gId = "", gSecret = "";   // from assets/tts_gate.cfg
     static volatile boolean passed = false;     // the gate has been cleared in this process
     static volatile boolean rechecked = false;
     static volatile boolean showing = false;
@@ -80,12 +91,10 @@ public final class TTSGate {
     }
 
     static void show(Activity from) {
-        if (showing) return;
-        showing = true;
         try {
             Intent i = new Intent(from, GateActivity.class);
             i.addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | Intent.FLAG_ACTIVITY_SINGLE_TOP);
-            from.startActivity(i);
+            from.startActivity(i);          // singleTop + reorder: an open login screen is only brought forward
         } catch (Throwable t) {
             showing = false;
         }
@@ -96,10 +105,12 @@ public final class TTSGate {
         try {
             InputStream in = c.getAssets().open("tts_gate.cfg");
             BufferedReader r = new BufferedReader(new InputStreamReader(in, "UTF-8"));
-            String a = r.readLine(), b = r.readLine();
+            String a = r.readLine(), b = r.readLine(), c2 = r.readLine(), d = r.readLine();
             r.close();
             if (a != null) fbKey = a.trim();
             if (b != null) fbPid = b.trim();
+            if (c2 != null) gId = c2.trim();
+            if (d != null) gSecret = d.trim();
         } catch (Throwable t) {
             // missing config -> the gate cannot verify anybody -> it stays shut (fail closed)
         }
@@ -141,6 +152,153 @@ public final class TTSGate {
         return r;
     }
 
+    // ---------------------------------------------------------------- Google sign-in (browser + loopback + PKCE)
+    static final class GFlow {
+        final String verifier, challenge, state;
+        final ServerSocket ss;
+        final int port;
+        volatile boolean cancelled = false;
+        String error = "";
+
+        GFlow() throws Exception {
+            SecureRandom rnd = new SecureRandom();
+            byte[] v = new byte[64]; rnd.nextBytes(v);
+            verifier = b64url(v);
+            challenge = b64url(MessageDigest.getInstance("SHA-256").digest(verifier.getBytes("US-ASCII")));
+            byte[] st = new byte[18]; rnd.nextBytes(st);
+            state = b64url(st);
+            ss = new ServerSocket(0, 5, InetAddress.getByName("127.0.0.1"));   // loopback only
+            port = ss.getLocalPort();
+        }
+
+        String redirect() { return "http://127.0.0.1:" + port; }
+
+        String url() throws Exception {
+            return GOOGLE_AUTH + "?client_id=" + URLEncoder.encode(gId, "UTF-8")
+                + "&redirect_uri=" + URLEncoder.encode(redirect(), "UTF-8")
+                + "&response_type=code&scope=" + URLEncoder.encode("openid email profile", "UTF-8")
+                + "&code_challenge=" + challenge + "&code_challenge_method=S256"
+                + "&state=" + state + "&prompt=select_account";
+        }
+
+        void cancel() { cancelled = true; try { ss.close(); } catch (Throwable t) { } }
+
+        /** blocks until the browser comes back with the code (or timeout / cancel); null = no code, see error */
+        String waitCode(int seconds) {
+            long end = System.currentTimeMillis() + seconds * 1000L;
+            try {
+                ss.setSoTimeout(1000);
+                while (!cancelled && System.currentTimeMillis() < end) {
+                    Socket c;
+                    try { c = ss.accept(); } catch (java.net.SocketTimeoutException e) { continue; }
+                    try {
+                        c.setSoTimeout(3000);
+                        String line = readLine(c.getInputStream());
+                        // drain the headers
+                        for (int i = 0; i < 64; i++) { String h = readLine(c.getInputStream()); if (h == null || h.length() == 0) break; }
+                        String code = null, st = null, err = null;
+                        if (line != null && line.startsWith("GET ")) {
+                            int sp = line.indexOf(' ', 4);
+                            String target = line.substring(4, sp < 0 ? line.length() : sp);
+                            int q = target.indexOf('?');
+                            if (q >= 0) {
+                                for (String kv : target.substring(q + 1).split("&")) {
+                                    int e = kv.indexOf('=');
+                                    if (e < 0) continue;
+                                    String k = kv.substring(0, e), v = URLDecoder.decode(kv.substring(e + 1), "UTF-8");
+                                    if (k.equals("code")) code = v; else if (k.equals("state")) st = v; else if (k.equals("error")) err = v;
+                                }
+                            }
+                        }
+                        boolean mine = st != null && st.equals(state);     // anything else (favicon, strangers) is ignored
+                        String page = mine ? (code != null ? "Sign-in complete. Go back to TTS Trainz Simulator."
+                                                           : "Sign-in was cancelled. Go back to the game.")
+                                           : "";
+                        byte[] body = page.getBytes("UTF-8");
+                        OutputStream o = c.getOutputStream();
+                        o.write(("HTTP/1.1 " + (mine ? "200 OK" : "404 Not Found") + "\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                            + "Content-Length: " + body.length + "\r\nConnection: close\r\n\r\n").getBytes("US-ASCII"));
+                        o.write(body); o.flush();
+                        if (mine) {
+                            if (code != null) return code;
+                            error = err != null ? err : "cancelled";
+                            return null;
+                        }
+                    } catch (Throwable t) {
+                        // a broken connection: keep waiting
+                    } finally {
+                        try { c.close(); } catch (Throwable t) { }
+                    }
+                }
+            } catch (Throwable t) {
+                if (!cancelled) error = "server";
+            } finally {
+                try { ss.close(); } catch (Throwable t) { }
+            }
+            if (error.length() == 0) error = cancelled ? "cancelled" : "timeout";
+            return null;
+        }
+    }
+
+    static String readLine(InputStream in) throws Exception {
+        StringBuilder sb = new StringBuilder();
+        int ch;
+        while ((ch = in.read()) >= 0) {
+            if (ch == '\n') break;
+            if (ch != '\r') sb.append((char) ch);
+            if (sb.length() > 4096) break;
+        }
+        return (ch < 0 && sb.length() == 0) ? null : sb.toString();
+    }
+
+    static String b64url(byte[] b) {
+        final String A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        for (; i + 2 < b.length; i += 3) {
+            int n = ((b[i] & 255) << 16) | ((b[i + 1] & 255) << 8) | (b[i + 2] & 255);
+            sb.append(A.charAt(n >> 18 & 63)).append(A.charAt(n >> 12 & 63)).append(A.charAt(n >> 6 & 63)).append(A.charAt(n & 63));
+        }
+        if (b.length - i == 1) {
+            int n = (b[i] & 255) << 16;
+            sb.append(A.charAt(n >> 18 & 63)).append(A.charAt(n >> 12 & 63));
+        } else if (b.length - i == 2) {
+            int n = ((b[i] & 255) << 16) | ((b[i + 1] & 255) << 8);
+            sb.append(A.charAt(n >> 18 & 63)).append(A.charAt(n >> 12 & 63)).append(A.charAt(n >> 6 & 63));
+        }
+        return sb.toString();
+    }
+
+    /** the Google code -> Google id_token -> Firebase session -> the same access check as email login */
+    static Res googleFinish(String code, GFlow f, String dev) {
+        if (fbKey.length() == 0 || fbPid.length() == 0 || gId.length() == 0) return new Res(NOCFG, "Google sign-in is not configured.");
+        try {
+            String form = "code=" + URLEncoder.encode(code, "UTF-8") + "&client_id=" + URLEncoder.encode(gId, "UTF-8")
+                + "&redirect_uri=" + URLEncoder.encode(f.redirect(), "UTF-8") + "&grant_type=authorization_code"
+                + "&code_verifier=" + URLEncoder.encode(f.verifier, "UTF-8");
+            if (gSecret.length() > 0) form += "&client_secret=" + URLEncoder.encode(gSecret, "UTF-8");
+            JSONObject g = new JSONObject(httpForm(GOOGLE_TOKEN, form));
+            String gid = g.optString("id_token", "");
+            if (gid.length() == 0) return new Res(ERR, "Google did not return an id token.");
+            JSONObject body = new JSONObject();
+            body.put("postBody", "id_token=" + gid + "&providerId=google.com");
+            body.put("requestUri", "http://localhost");
+            body.put("returnSecureToken", true);
+            body.put("returnIdpCredential", true);
+            JSONObject r = new JSONObject(http("POST", AUTH_BASE + "/v1/accounts:signInWithIdp?key=" + fbKey, body.toString(), null));
+            String idToken = r.optString("idToken", ""), uid = r.optString("localId", ""), refresh = r.optString("refreshToken", "");
+            if (idToken.length() == 0 || uid.length() == 0) return new Res(ERR, "Firebase sign-in failed.");
+            Res a = access(uid, idToken, r.optString("email", ""), dev);
+            a.uid = uid; a.refresh = refresh;
+            return a;
+        } catch (HttpErr he) {
+            if (he.code >= 500 || he.code == 429) return new Res(NET, "Server busy. Try again in a moment.");
+            return new Res(ERR, "Google sign-in failed (" + he.code + ").");
+        } catch (Throwable t) {
+            return new Res(NET, "No connection. Check your internet.");
+        }
+    }
+
     /** background re-check with the saved refresh token; NET = could not tell (keep the grace period) */
     static Res recheck(String refresh, String dev) {
         try {
@@ -177,13 +335,17 @@ public final class TTSGate {
             String status = fsStr(f, "status"), bound = fsStr(f, "device");
             boolean admin = fsBool(f, "admin");
             if (admin) {
-                if (bound.length() == 0) bind(url, idToken, dev);
+                if (bound.length() == 0) bind(url, idToken, dev);     // owner: works on any phone, binding is only informative
                 return new Res(OK, "");
             }
             if ("blocked".equals(status)) return new Res(BLOCKED, "This account is blocked.");
             if (!"approved".equals(status)) return new Res(PENDING, "Waiting for the developer to approve your access.");
             if (bound.length() == 0) {
                 bind(url, idToken, dev);
+                // two phones can race the first bind: only the first PATCH wins, so READ IT BACK and compare
+                JSONObject again = new JSONObject(http("GET", url, null, idToken));
+                String now = fsStr(again.optJSONObject("fields"), "device");
+                if (!dev.equals(now)) return new Res(OTHER_DEVICE, "This account is already used on another device.");
             } else if (!bound.equals(dev)) {
                 return new Res(OTHER_DEVICE, "This account is already used on another device.");
             }
@@ -272,8 +434,9 @@ public final class TTSGate {
     public static final class GateActivity extends Activity {
         EditText email, pass;
         TextView status;
-        Button loginBtn, signupBtn;
+        Button loginBtn, signupBtn, googleBtn;
         String dev;
+        GFlow flow;
 
         @Override protected void onCreate(Bundle b) {
             super.onCreate(b);
@@ -296,6 +459,14 @@ public final class TTSGate {
             sub.setTextColor(0xFFAAB4C0); sub.setTextSize(14f); sub.setGravity(Gravity.CENTER);
             sub.setPadding(0, 6, 0, 24);
             root.addView(sub);
+
+            googleBtn = new Button(this); googleBtn.setText("Sign in with Google");
+            root.addView(googleBtn);
+            TextView or = new TextView(this);
+            or.setText("or use email");
+            or.setTextColor(0xFF66707A); or.setTextSize(12f); or.setGravity(Gravity.CENTER);
+            or.setPadding(0, 12, 0, 4);
+            root.addView(or);
 
             email = new EditText(this);
             email.setHint("Email");
@@ -335,16 +506,59 @@ public final class TTSGate {
 
             loginBtn.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { go(false); } });
             signupBtn.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { go(true); } });
+            googleBtn.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { goGoogle(); } });
         }
 
         @Override public void onBackPressed() { finishAffinity(); }   // no way past the gate
 
-        @Override protected void onDestroy() { showing = false; super.onDestroy(); }
+        @Override protected void onDestroy() { if (flow != null) flow.cancel(); showing = false; super.onDestroy(); }
 
         void setStatus(final String s, final boolean enable) {
             runOnUiThread(new Runnable() { public void run() {
-                status.setText(s); loginBtn.setEnabled(enable); signupBtn.setEnabled(enable);
+                status.setText(s); loginBtn.setEnabled(enable); signupBtn.setEnabled(enable); googleBtn.setEnabled(true);
             } });
+        }
+
+        void goGoogle() {
+            loadConfig(getApplicationContext());
+            if (gId.length() == 0) { setStatus("Google sign-in is not configured in this build.", true); return; }
+            try {
+                if (flow != null) flow.cancel();                 // a second tap restarts cleanly
+                final GFlow f = new GFlow();
+                flow = f;
+                setStatus("Opening Google... pick your account, then come back to the game.", true);
+                final String u = f.url();
+                new Thread(new Runnable() { public void run() {
+                    String code = f.waitCode(300);
+                    if (code == null) {
+                        if (!"cancelled".equals(f.error) || flow == f) setStatus(googleMsg(f.error), true);
+                        return;
+                    }
+                    try {                                         // pull the game back over the browser
+                        Intent back = new Intent(GateActivity.this, GateActivity.class);
+                        back.addFlags(0x10000000 | 0x20000 | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                        startActivity(back);
+                    } catch (Throwable ignore) { }
+                    setStatus("Checking your access...", false);
+                    Res r = googleFinish(code, f, dev);
+                    if (r.code == OK) {
+                        saveSession(getApplicationContext(), r.uid, dev, r.refresh);
+                        passed = true;
+                        runOnUiThread(new Runnable() { public void run() { finish(); } });
+                    } else {
+                        setStatus(r.msg, true);
+                    }
+                } }).start();
+                startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(u)));
+            } catch (Throwable t) {
+                setStatus("Could not open the browser for Google sign-in.", true);
+            }
+        }
+
+        String googleMsg(String e) {
+            if ("timeout".equals(e)) return "Google sign-in timed out. Try again.";
+            if ("access_denied".equals(e) || "cancelled".equals(e)) return "Google sign-in was cancelled.";
+            return "Google sign-in failed.";
         }
 
         void go(final boolean signup) {
