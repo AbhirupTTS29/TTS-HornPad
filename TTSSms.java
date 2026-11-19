@@ -14,6 +14,7 @@ import java.nio.channels.FileChannel;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Locale;
 import java.util.Random;
 
@@ -1001,6 +1002,8 @@ public final class TTSSms {
         boolean stereo, ignore3d;
         float rolloff;
         boolean active, wasOut = true;
+        boolean hornChecked, partial;       // r141: the horn / bell / sander streams stay audible in a passenger view
+        final HashSet<Stream> keep = new HashSet<Stream>();
         float distSq;
         String name;
         Engine eng;
@@ -1266,21 +1269,59 @@ public final class TTSSms {
                     for (Trig t : st.varTrigs) tryTrigger(st, t, v, e);
                 return;
             }
+            if (!hornChecked) {
+                hornChecked = true;
+                for (Stream st : streams)
+                    for (Trig t : st.trigs)
+                        if (t.kind == T_DISCRETE && (t.event == 8 || t.event == 9 || t.event == 10 || t.event == 11 || t.event == 4 || t.event == 5))
+                            keep.add(st);
+            }
             if (!active) {
                 if (met(actCab, actExt, actPass, v.cam) && (actDist == 0 || distSq < actDist * actDist)) {
                     active = true;
+                    partial = false;
                     for (Stream st : streams) {
                         st.setFreqAndVolume(v);
                         st.al.setActive(true, e);
                     }
+                } else if (v.cam == 2 && !keep.isEmpty() && (actDist == 0 || distSq < actDist * actDist)) {
+                    // entered / started inside a coach: only the horn / bell / sander streams
+                    active = true;
+                    partial = true;
+                    for (Stream st : streams)
+                        if (keep.contains(st)) {
+                            st.setFreqAndVolume(v);
+                            st.al.setActive(true, e);
+                        }
                 }
             } else {
-                if (met(deCab, deExt, dePass, v.cam) || (deDist != 0 && distSq > deDist * deDist)) {
-                    for (Stream st : streams) {
-                        st.al.setActive(false, e);
-                        st.al.hardDeactivate(e);
+                boolean far = deDist != 0 && distSq > deDist * deDist;
+                if (met(deCab, deExt, dePass, v.cam) || far) {
+                    if (!far && v.cam == 2 && !keep.isEmpty()) {
+                        // inside a coach: the engine loops stay quiet (the .sms says so), the horn / bell / sander play
+                        if (!partial) {
+                            partial = true;
+                            for (Stream st : streams)
+                                if (!keep.contains(st)) {
+                                    st.al.setActive(false, e);
+                                    st.al.hardDeactivate(e);
+                                }
+                        }
+                    } else {
+                        for (Stream st : streams) {
+                            st.al.setActive(false, e);
+                            st.al.hardDeactivate(e);
+                        }
+                        active = false;
+                        partial = false;
                     }
-                    active = false;
+                } else if (partial) {
+                    partial = false;
+                    for (Stream st : streams)
+                        if (!keep.contains(st)) {
+                            st.setFreqAndVolume(v);
+                            st.al.setActive(true, e);
+                        }
                 }
             }
             for (Stream st : streams) st.update(v, e);
