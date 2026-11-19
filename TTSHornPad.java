@@ -95,7 +95,12 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
     public void onActivityResumed(Activity a) {
         try {
             if (!GAME.equals(a.getClass().getName())) return;
-            if (!TTSIntro.check(a)) return;                // r145: intro video + disclaimer first
+            final Activity fa = a;                         // r145b: intro overlay first, then this same start again
+            if (!TTSIntro.check(a, new Runnable() {
+                public void run() {
+                    onActivityResumed(fa);
+                }
+            })) return;
             if (!TTSGate.check(a)) return;                 // login gate: the game stays shut until an approved login
             if (owner != a || hud.view == null || hud.view.getParent() == null) {
                 hud.loadPrefs(a);
@@ -131,6 +136,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
     @Override
     public void onActivityPaused(Activity a) {
         try {
+            TTSIntro.pause(a);
             if (a == owner) {
                 mixer.stopAll();
                 weather.setPaused(true);

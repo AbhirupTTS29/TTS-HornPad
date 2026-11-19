@@ -1,20 +1,17 @@
 package com.n3vgames.android;
 
 import android.app.Activity;
-import android.content.Intent;
 import android.graphics.Color;
+import android.graphics.SurfaceTexture;
 import android.graphics.Typeface;
 import android.media.MediaPlayer;
-import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.Gravity;
-import android.view.SurfaceHolder;
-import android.view.SurfaceView;
+import android.view.Surface;
+import android.view.TextureView;
 import android.view.View;
 import android.view.ViewGroup;
-import android.view.Window;
-import android.view.WindowManager;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -24,40 +21,50 @@ import java.io.FileOutputStream;
 import java.io.InputStream;
 
 /**
- * r145: intro before the game.  The first time the game screen comes up in a process, IntroActivity is put in
- * front of it: it plays assets/tts_intro.mp4 (tap = skip), then shows the disclaimer (tap = continue), then
- * closes and the game (and the login gate after it) carries on.  A missing / broken video goes straight to the
- * disclaimer; nothing here can keep the game shut.
+ * r145b: intro before the game, drawn as an overlay ON the game screen (no separate Activity: r145's own
+ * Activity paused the game behind it and the game came back black).  The game keeps loading underneath.
+ * Video (assets/tts_intro.mp4, tap = skip) -> disclaimer (tap = continue) -> overlay removed -> then() runs the
+ * normal start (login gate, HUD, pad).  Every step is written to TTSHornPad.log.  Nothing here can keep the
+ * game shut: a missing video / player error goes to the disclaimer, a crash removes the overlay.
  */
 public final class TTSIntro {
     static volatile boolean done;
-    static volatile boolean showing;
     static final String ASSET = "tts_intro.mp4";
+    static Overlay ov;
 
-    /** true = intro finished, the game may go on; false = the intro is (being) shown in front. */
-    public static boolean check(Activity game) {
+    /** true = intro finished, go on; false = the intro is on screen, then() is run when it closes. */
+    public static boolean check(Activity game, Runnable then) {
         if (done) return true;
-        if (showing) return false;
-        showing = true;
         try {
-            Intent i = new Intent(game, IntroActivity.class);
-            i.addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | Intent.FLAG_ACTIVITY_SINGLE_TOP);
-            game.startActivity(i);
-            game.overridePendingTransition(0, 0);
+            if (ov != null && ov.host == game && ov.root.getParent() != null) {
+                ov.then = then;
+                ov.resume();
+                return false;
+            }
+            if (ov != null) ov.drop();
+            ov = new Overlay(game, then);
             return false;
         } catch (Throwable t) {
             TTSHornPad.log("intro: " + t);
-            showing = false;
-            done = true;                     // never block the game because of the intro
+            done = true;                                   // never block the game because of the intro
             return true;
         }
     }
 
+    /** the game went to the background: hold the video */
+    public static void pause(Activity a) {
+        try {
+            if (ov != null && ov.host == a) ov.pause();
+        } catch (Throwable t) {
+            // keep
+        }
+    }
+
     /** the video, kept at its own 16:9 shape in the middle of the black screen */
-    static final class FitSurface extends SurfaceView {
+    static final class FitTexture extends TextureView {
         float aspect = 16f / 9f;
 
-        FitSurface(Activity a) {
+        FitTexture(Activity a) {
             super(a);
         }
 
@@ -73,126 +80,93 @@ public final class TTSIntro {
         }
     }
 
-    public static final class IntroActivity extends Activity implements SurfaceHolder.Callback {
-        FrameLayout root;
-        FitSurface sv;
-        TextView hint;
-        MediaPlayer mp;
-        int stage;                           // 0 video, 1 disclaimer, 2 leaving
-        long stageAt;
-        boolean surfaceOk;
+    static final class Overlay implements TextureView.SurfaceTextureListener {
+        final Activity host;
+        final FrameLayout root;
+        final FitTexture tv;
         final Handler h = new Handler(Looper.getMainLooper());
+        Runnable then;
+        MediaPlayer mp;
+        Surface surface;
+        String path;
+        int stage;                                         // 0 video, 1 disclaimer, 2 gone
+        long stageAt;
+        boolean prepared, paused;
 
-        @Override
-        protected void onCreate(Bundle b) {
-            try {
-                requestWindowFeature(Window.FEATURE_NO_TITLE);
-            } catch (Throwable t) {
-                // keep
-            }
-            super.onCreate(b);
-            try {
-                setRequestedOrientation(6);  // sensorLandscape, like the game
-                getWindow().addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN
-                        | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-            } catch (Throwable t) {
-                // keep
-            }
-            root = new FrameLayout(this);
+        Overlay(Activity a, Runnable then) {
+            host = a;
+            this.then = then;
+            root = new FrameLayout(a);
             root.setBackgroundColor(Color.BLACK);
+            root.setClickable(true);                       // the game under it gets no touches
             root.setOnClickListener(new View.OnClickListener() {
                 public void onClick(View v) {
+                    TTSHornPad.log("intro: tap (stage " + stage + ")");
                     next();
                 }
             });
-            sv = new FitSurface(this);
-            root.addView(sv, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+            tv = new FitTexture(a);
+            tv.setSurfaceTextureListener(this);
+            root.addView(tv, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.MATCH_PARENT, Gravity.CENTER));
-            hint = new TextView(this);
+            TextView hint = new TextView(a);
             hint.setText("Tap to skip");
             hint.setTextColor(0x88FFFFFF);
             hint.setTextSize(12f);
             hint.setPadding(0, 0, dp(22), dp(16));
             root.addView(hint, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.RIGHT));
-            setContentView(root);
-            immersive();
+            a.addContentView(root, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT));
             stageAt = System.currentTimeMillis();
-            sv.getHolder().addCallback(this);
-            h.postDelayed(new Runnable() {          // safety: never sit on a black screen
+            TTSHornPad.log("intro: overlay on");
+            new Thread(new Runnable() {
                 public void run() {
-                    if (stage == 0 && (mp == null || !mp.isPlaying())) next();
+                    final String p = copyVideo();
+                    h.post(new Runnable() {
+                        public void run() {
+                            path = p;
+                            if (p == null) {
+                                next();
+                                return;
+                            }
+                            tryStart();
+                        }
+                    });
+                }
+            }, "TTSIntro").start();
+            h.postDelayed(new Runnable() {                 // safety: never sit on a black screen
+                public void run() {
+                    if (stage == 0 && !prepared) {
+                        TTSHornPad.log("intro: video did not start in 6 s");
+                        next();
+                    }
                 }
             }, 6000);
         }
 
         int dp(float v) {
-            return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
-        }
-
-        void immersive() {
-            try {
-                getWindow().getDecorView().setSystemUiVisibility(0x1706);   // immersive sticky, fullscreen, hide nav
-            } catch (Throwable t) {
-                // keep
-            }
-        }
-
-        @Override
-        public void onWindowFocusChanged(boolean f) {
-            super.onWindowFocusChanged(f);
-            if (f) immersive();
-        }
-
-        // ------------------------------------------------------------------ video
-        public void surfaceCreated(final SurfaceHolder holder) {
-            surfaceOk = true;
-            if (stage != 0) return;
-            if (mp != null) {
-                try {
-                    mp.setDisplay(holder);
-                    mp.start();
-                } catch (Throwable t) {
-                    // keep
-                }
-                return;
-            }
-            new Thread(new Runnable() {
-                public void run() {
-                    final String path = copyVideo();
-                    h.post(new Runnable() {
-                        public void run() {
-                            play(path, holder);
-                        }
-                    });
-                }
-            }, "TTSIntro").start();
-        }
-
-        public void surfaceChanged(SurfaceHolder holder, int f, int w, int hh) { }
-
-        public void surfaceDestroyed(SurfaceHolder holder) {
-            surfaceOk = false;
-            try {
-                if (mp != null && mp.isPlaying()) mp.pause();
-            } catch (Throwable t) {
-                // keep
-            }
+            return (int) (v * host.getResources().getDisplayMetrics().density + 0.5f);
         }
 
         /** the APK keeps assets compressed, so the player gets a plain copy in the cache */
         String copyVideo() {
             try {
-                File f = new File(getCacheDir(), ASSET);
-                InputStream in = getAssets().open(ASSET);       // copied every start: an update brings its own intro
-                File tmp = new File(getCacheDir(), ASSET + ".tmp");
+                File f = new File(host.getCacheDir(), ASSET);
+                File tmp = new File(host.getCacheDir(), ASSET + ".tmp");
+                InputStream in = host.getAssets().open(ASSET);
                 FileOutputStream out = new FileOutputStream(tmp);
                 byte[] buf = new byte[65536];
                 int n;
-                while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                long total = 0;
+                while ((n = in.read(buf)) > 0) {
+                    out.write(buf, 0, n);
+                    total += n;
+                }
                 out.close();
                 in.close();
-                if (!tmp.renameTo(f)) return tmp.getAbsolutePath();
+                if (!tmp.renameTo(f)) f = tmp;
+                TTSHornPad.log("intro: video ready " + total + " bytes");
                 return f.getAbsolutePath();
             } catch (Throwable t) {
                 TTSHornPad.log("intro video: " + t);
@@ -200,28 +174,63 @@ public final class TTSIntro {
             }
         }
 
-        void play(String path, SurfaceHolder holder) {
-            if (stage != 0 || isFinishing()) return;
-            if (path == null || !surfaceOk) {
-                if (path == null) next();
-                return;
+        // ------------------------------------------------------------------ TextureView
+        public void onSurfaceTextureAvailable(SurfaceTexture st, int w, int hh) {
+            surface = new Surface(st);
+            tryStart();
+        }
+
+        public void onSurfaceTextureSizeChanged(SurfaceTexture st, int w, int hh) { }
+
+        public boolean onSurfaceTextureDestroyed(SurfaceTexture st) {
+            try {
+                if (mp != null) mp.setSurface(null);
+            } catch (Throwable t) {
+                // keep
             }
+            try {
+                if (surface != null) surface.release();
+            } catch (Throwable t) {
+                // keep
+            }
+            surface = null;
+            return true;
+        }
+
+        public void onSurfaceTextureUpdated(SurfaceTexture st) { }
+
+        void tryStart() {
+            if (stage != 0 || mp != null || path == null || surface == null) return;
             try {
                 mp = new MediaPlayer();
                 mp.setDataSource(path);
-                mp.setDisplay(holder);
+                mp.setSurface(surface);
                 mp.setOnPreparedListener(new MediaPlayer.OnPreparedListener() {
                     public void onPrepared(MediaPlayer p) {
+                        prepared = true;
                         int vw = p.getVideoWidth(), vh = p.getVideoHeight();
                         if (vw > 0 && vh > 0) {
-                            sv.aspect = vw / (float) vh;
-                            sv.requestLayout();
+                            tv.aspect = vw / (float) vh;
+                            tv.requestLayout();
                         }
-                        if (stage == 0) p.start();
+                        TTSHornPad.log("intro: playing " + vw + "x" + vh + " " + p.getDuration() + " ms");
+                        if (stage == 0 && !paused) p.start();
+                        // the end does not depend on the completion callback alone
+                        int dur = p.getDuration();
+                        if (dur <= 0 || dur > 30000) dur = 12000;
+                        h.postDelayed(new Runnable() {
+                            public void run() {
+                                if (stage == 0 && !paused) {
+                                    TTSHornPad.log("intro: end by timer");
+                                    next();
+                                }
+                            }
+                        }, dur + 1500);
                     }
                 });
                 mp.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
                     public void onCompletion(MediaPlayer p) {
+                        TTSHornPad.log("intro: video end");
                         if (stage == 0) next();
                     }
                 });
@@ -239,47 +248,70 @@ public final class TTSIntro {
             }
         }
 
+        void pause() {
+            paused = true;
+            try {
+                if (mp != null && mp.isPlaying()) mp.pause();
+            } catch (Throwable t) {
+                // keep
+            }
+        }
+
+        void resume() {
+            paused = false;
+            try {
+                if (stage == 0 && mp != null && prepared && !mp.isPlaying()) mp.start();
+            } catch (Throwable t) {
+                // keep
+            }
+        }
+
         void stopVideo() {
-            try {
-                if (mp != null) {
-                    mp.setOnCompletionListener(null);
-                    mp.setOnErrorListener(null);
-                    mp.stop();
-                }
-            } catch (Throwable t) {
-                // keep
-            }
-            try {
-                if (mp != null) mp.release();
-            } catch (Throwable t) {
-                // keep
-            }
+            MediaPlayer p = mp;
             mp = null;
+            if (p == null) return;
+            try {
+                p.setOnCompletionListener(null);
+                p.setOnErrorListener(null);
+                p.stop();
+            } catch (Throwable t) {
+                // keep
+            }
+            try {
+                p.release();
+            } catch (Throwable t) {
+                // keep
+            }
         }
 
         // ------------------------------------------------------------------ steps
         void next() {
-            long now = System.currentTimeMillis();
-            if (stage == 0) {
-                stopVideo();
-                showDisclaimer();
-                stage = 1;
-                stageAt = now;
-            } else if (stage == 1) {
-                if (now - stageAt < 700) return;         // a double tap must not skip the disclaimer unread
-                stage = 2;
-                leave();
+            try {
+                long now = System.currentTimeMillis();
+                if (stage == 0) {
+                    stage = 1;
+                    stageAt = now;
+                    stopVideo();
+                    showDisclaimer();
+                    TTSHornPad.log("intro: disclaimer");
+                } else if (stage == 1) {
+                    if (now - stageAt < 700) return;      // a double tap must not skip the disclaimer unread
+                    finishIntro();
+                }
+            } catch (Throwable t) {
+                TTSHornPad.log("intro next: " + t);
+                finishIntro();
             }
         }
 
         void showDisclaimer() {
             root.removeAllViews();
-            LinearLayout box = new LinearLayout(this);
+            LinearLayout box = new LinearLayout(host);
             box.setOrientation(LinearLayout.VERTICAL);
             box.setGravity(Gravity.CENTER);
             box.setPadding(dp(40), dp(20), dp(40), dp(20));
 
-            TextView t = new TextView(this);
+            TextView t = new TextView(host);
             t.setText("DISCLAIMER");
             t.setTextColor(0xFFFFB347);
             t.setTextSize(22f);
@@ -288,14 +320,14 @@ public final class TTSIntro {
             t.setGravity(Gravity.CENTER);
             box.addView(t);
 
-            View line = new View(this);
+            View line = new View(host);
             line.setBackgroundColor(0xFFFF8C20);
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(120), dp(2));
             lp.topMargin = dp(10);
             lp.bottomMargin = dp(16);
             box.addView(line, lp);
 
-            TextView body = new TextView(this);
+            TextView body = new TextView(host);
             body.setText(DISCLAIMER);
             body.setTextColor(0xFFD8DCE2);
             body.setTextSize(13.5f);
@@ -303,7 +335,7 @@ public final class TTSIntro {
             body.setGravity(Gravity.CENTER);
             box.addView(body, new LinearLayout.LayoutParams(dp(560), ViewGroup.LayoutParams.WRAP_CONTENT));
 
-            TextView tap = new TextView(this);
+            TextView tap = new TextView(host);
             tap.setText("Tap anywhere to continue");
             tap.setTextColor(0xAAFFFFFF);
             tap.setTextSize(12f);
@@ -313,53 +345,35 @@ public final class TTSIntro {
 
             root.addView(box, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.MATCH_PARENT, Gravity.CENTER));
-            box.setAlpha(0f);
-            box.animate().alpha(1f).setDuration(450).start();
         }
 
-        void leave() {
+        void finishIntro() {
+            if (stage == 2) return;
+            stage = 2;
             done = true;
-            showing = false;
-            try {
-                finish();
-                overridePendingTransition(android.R.anim.fade_in, android.R.anim.fade_out);
-            } catch (Throwable t) {
-                // keep
+            drop();
+            TTSHornPad.log("intro: done -> game");
+            Runnable r = then;
+            then = null;
+            if (r != null) {
+                try {
+                    r.run();
+                } catch (Throwable t) {
+                    TTSHornPad.log("intro then: " + t);
+                }
             }
         }
 
-        @Override
-        public void onBackPressed() {
-            next();                                      // back = the same as a tap
-        }
-
-        @Override
-        protected void onPause() {
-            super.onPause();
-            try {
-                if (mp != null && mp.isPlaying()) mp.pause();
-            } catch (Throwable t) {
-                // keep
-            }
-        }
-
-        @Override
-        protected void onResume() {
-            super.onResume();
-            immersive();
-            try {
-                if (stage == 0 && mp != null && surfaceOk && !mp.isPlaying()) mp.start();
-            } catch (Throwable t) {
-                // keep
-            }
-        }
-
-        @Override
-        protected void onDestroy() {
-            stopVideo();
+        void drop() {
             h.removeCallbacksAndMessages(null);
-            if (!done) showing = false;                  // closed some other way: show again next time
-            super.onDestroy();
+            stopVideo();
+            try {
+                ViewGroup p = (ViewGroup) root.getParent();
+                if (p != null) p.removeView(root);
+            } catch (Throwable t) {
+                // keep
+            }
+            if (ov == this) ov = null;
         }
     }
 
