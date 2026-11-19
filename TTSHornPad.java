@@ -64,6 +64,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
     static final Watcher watcher = new Watcher();
     static final Weather weather = new Weather();
     static final Hiss hiss = new Hiss();           // r143: air brake hiss
+    static final boolean SQUEAL_ON = false;        // r144c: squeal switched off for now (code kept; set true when a good sample is in)
     static final Squeal squeal = new Squeal();     // r144: wheel/brake squeal while braking below 12 km/h
     static volatile boolean brk;                   // brake applied (from TTSBRK)
 
@@ -1482,20 +1483,73 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         }
     }
 
+    /** r144b: the squeal voice (pure maths, no android): metallic stick-slip screech, NOT a pure tone.
+     *  Two FM voices (the second one inharmonic), a wandering pitch, ~30 Hz stick-slip roughness, scrape noise,
+     *  and it comes in bursts with gaps like a real brake shoe / wheel. */
+    static final class SqDsp {
+        final java.util.Random rnd = new java.util.Random(7);
+        float amp, ph1, ph2, ph3, fj, fjT, rough, hp, hpx, lp, burst, burstT, bTarget = 1f, nzS = 0.5f, nz = 0.5f, nzN;
+        boolean inBurst = true;
+
+        float tick(float lvl, float x, float fc) {
+            // pitch: low for a steel screech, creeping up a little as the wheels slow
+            float f0 = fc > 0f ? fc : 560f + 330f * x;
+            amp += (lvl - amp) * (lvl > amp ? 0.0009f : 0.0005f);
+            if (--burstT <= 0f) {
+                inBurst = !inBurst;
+                burstT = inBurst ? (int) (RATE * (0.5f + 1.1f * rnd.nextFloat())) : (int) (RATE * (0.25f + 0.9f * rnd.nextFloat()));
+                bTarget = inBurst ? 0.55f + 0.45f * rnd.nextFloat() : 0f;
+            }
+            burst += (bTarget - burst) * 0.0016f;
+            if (--nzN <= 0f) {
+                nz = 0.25f + 0.75f * rnd.nextFloat();
+                nzN = 500f + rnd.nextInt(2500);
+            }
+            nzS += (nz - nzS) * 0.002f;
+            // wandering pitch (random walk), never a clean vibrato
+            if (--fjT <= 0f) {
+                fj = (rnd.nextFloat() - 0.5f) * 0.09f;
+                fjT = 800f + rnd.nextInt(3000);
+            }
+            fjS += (fj - fjS) * 0.0008f;
+            float f = f0 * (1f + fjS);
+            ph1 += f / RATE;
+            ph2 += f * 1.337f / RATE;
+            ph3 += f * 0.5f / RATE;
+            if (ph1 > 1f) ph1 -= 1f;
+            if (ph2 > 1f) ph2 -= 1f;
+            if (ph3 > 1f) ph3 -= 1f;
+            float t1 = 6.2831853f * ph1;
+            float s1 = (float) Math.sin(t1 + 1.1f * Math.sin(2f * t1));
+            float s2 = (float) Math.sin(6.2831853f * ph2 + 0.7f * Math.sin(6.2831853f * ph2 * 1.41f));
+            float s3 = (float) Math.sin(6.2831853f * ph3);
+            // stick-slip roughness
+            rough += (28f + 10f * x) / RATE;
+            if (rough > 1f) rough -= 1f;
+            float r = 0.55f + 0.45f * (float) Math.sin(6.2831853f * rough);
+            float w = rnd.nextFloat() * 2f - 1f;
+            hp = 0.8f * (hp + w - hpx);
+            hpx = w;
+            lp += (hp - lp) * 0.10f;
+            float s = (s1 * 0.55f + s2 * 0.32f + s3 * 0.2f) * r + lp * 0.30f;
+            return s * amp * burst * (0.3f + 0.7f * nzS) * 0.9f;
+        }
+        float fjS;
+    }
+
     /** r144: brake squeal. Only while braking (speed falling, brake applied) and only from 12 km/h down to a stop. */
     static final class Squeal implements Runnable {
         Thread th;
         AudioTrack track;
         volatile boolean paused;
-        final java.util.Random rnd = new java.util.Random();
-        float amp, nz, nzT, ph1, ph2, ph3, vib, hp, hpx, lp;
+        final SqDsp dsp = new SqDsp();
         boolean active;
         int chirp;                               // samples left of the final stop chirp
         float lastV;
 
         synchronized void setPaused(boolean p) {
             paused = p;
-            if (!p && (th == null || !th.isAlive())) {
+            if (SQUEAL_ON && !p && (th == null || !th.isAlive())) {
                 th = new Thread(this, "TTSSqueal");
                 th.setDaemon(true);
                 th.start();
@@ -1507,7 +1561,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             float d = TTSHornPad.camD;
             int ci = TTSHornPad.camIn;
             if (d < 0f) d = 5f;
-            return ci == 1 ? 0.55f : ci == 2 ? 0.75f : Math.min(1f, 10f / Math.max(d, 10f));
+            return ci == 1 ? 0.45f : ci == 2 ? 0.7f : Math.min(1f, 10f / Math.max(d, 10f));
         }
 
         public void run() {
@@ -1521,7 +1575,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             while (true) {
                 try {
                     synchronized (this) {
-                        while (paused || (!TTSSms.inOn && amp < 0.001f && chirp == 0)) {
+                        while (paused || (!TTSSms.inOn && dsp.amp < 0.001f && chirp == 0)) {
                             if (track != null) {
                                 try {
                                     track.pause();
@@ -1538,7 +1592,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                     float slope = TTSSms.inSlope;
                     boolean cond = TTSSms.inOn && v <= 3.33f && v > 0.08f
                             && (active ? slope < -0.02f : slope < -0.10f) && (brk || slope < -0.30f);
-                    if (active && !cond && lastV < 0.5f && v < 0.5f && amp > 0.05f && chirp == 0) chirp = (int) (RATE * 0.28f);
+                    if (active && !cond && lastV < 0.5f && v < 0.5f && dsp.amp > 0.05f && chirp == 0) chirp = (int) (RATE * 0.35f);
                     active = cond;
                     lastV = v;
                     render(out, chunk, v, cond);
@@ -1569,51 +1623,23 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         void render(short[] out, int chunk, float v, boolean on) {
             float g = viewGain();
             float x = 1f - Math.min(1f, v / 3.33f);              // 0 at 12 km/h, 1 at standstill
-            // loudest in the middle/low part of the range, fades in over the first km/h
-            float lvl = on ? Math.min(1f, (3.33f - v) / 0.9f) * (0.55f + 0.45f * x) : 0f;
-            float f0 = 1350f + 750f * x * x;                      // pitch climbs as the wheels slow down
+            float lvl = on ? Math.min(1f, (3.33f - v) / 1.2f) * (0.45f + 0.55f * x) : 0f;
             for (int i = 0; i < chunk; i++) {
                 float tgt = lvl;
-                float fc = f0;
+                float fc = 0f;
                 if (chirp > 0) {
-                    float c = chirp / (RATE * 0.28f);
-                    tgt = 0.9f * c;
-                    fc = f0 + 900f * (1f - c);
+                    float c = chirp / (RATE * 0.35f);
+                    tgt = 0.8f * c;
+                    fc = 900f - 330f * (1f - c);                  // last groan as the wheels stop
                     chirp--;
                 }
-                amp += (tgt - amp) * (tgt > amp ? 0.0012f : 0.0006f);
-                // stick-slip: slowly wandering amplitude with sharp dips
-                if (--nzT <= 0f) {
-                    nz = 0.35f + 0.65f * rnd.nextFloat();
-                    nzT = 600f + rnd.nextInt(3500);
-                }
-                vib += 6.5f / RATE;
-                if (vib > 1f) vib -= 1f;
-                float f = fc * (1f + 0.012f * (float) Math.sin(6.2831853f * vib));
-                ph1 += f / RATE;
-                ph2 += f * 1.507f / RATE;
-                ph3 += f * 2.03f / RATE;
-                if (ph1 > 1f) ph1 -= 1f;
-                if (ph2 > 1f) ph2 -= 1f;
-                if (ph3 > 1f) ph3 -= 1f;
-                float s = (float) Math.sin(6.2831853f * ph1) * 0.6f
-                        + (float) Math.sin(6.2831853f * ph2) * 0.25f
-                        + (float) Math.sin(6.2831853f * ph3) * 0.12f;
-                float w = rnd.nextFloat() * 2f - 1f;
-                hp = 0.85f * (hp + w - hpx);
-                hpx = w;
-                lp += (hp - lp) * 0.35f;
-                s += lp * 0.10f;                                  // a little scrape in the squeal
-                nzS += (nz - nzS) * 0.0015f;
-                float val = s * amp * nzS * 0.55f * g;
-                if (amp < 0.0005f && chirp == 0) val = 0f;
+                float val = dsp.tick(tgt, x, fc) * g;
                 val = val / (1f + Math.abs(val)) * 1.4f;
                 short sv = clip(val);
                 out[2 * i] = sv;
                 out[2 * i + 1] = sv;
             }
         }
-        float nzS = 0.5f;
     }
 
     static final class Weather implements Runnable {
