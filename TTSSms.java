@@ -605,6 +605,8 @@ public final class TTSSms {
             // camera
             float d = TTSHornPad.camD;
             int ci = TTSHornPad.camIn;
+            // r155: a track sound = the bogeys next to the camera: distance to the nearest vehicle, not to the loco
+            if (isTrack && ci != 1 && TTSHornPad.camN >= 0f) d = TTSHornPad.camN;
             if (d < 0f) d = 5f;
             vars.dist = d;
             vars.cam = ci;      // 0 outside, 1 cab, 2 passenger seat

@@ -324,6 +324,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             if (done > c) {
                 if (done >= 0) {
                     camD = -1f;
+                    camN = -1f;
                     camV = 0f;
                 }
                 return;
@@ -352,6 +353,10 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                     if (b > a && !(b == a + 1 && s.charAt(a) == '-')) vv = Integer.parseInt(s.substring(a, b));
                 }
                 camV = vv;
+                int nq = s.indexOf(" n=", e);
+                int nle = s.indexOf('\n', e);
+                if (nle < 0) nle = s.length();
+                camN = (nq > 0 && nq < nle) ? intAt(s, nq + 3) : -1f;   // r155
                 // r120c: pass geometry (decimetres): the pad follows the pass by itself between updates
                 int sq = s.indexOf(" S=", e), bq = s.indexOf(" B=", e), uq = s.indexOf(" U=", e);
                 int le = s.indexOf('\n', e);
@@ -591,6 +596,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
     static final int RATE = 44100;
     // r119: listener place for the horn pad (from TTSCAM lines); camD < 0 = not known yet (plain sound)
     static volatile float camD = -1f;
+    static volatile float camN = -1f;      // r155: metres camera -> nearest vehicle of the train (TTSCAM n=), -1 unknown
     static volatile int camIn;             // r123: 0 outside, 1 loco cab, 2 inside a coach (d = real distance)
     static volatile float camV;
     // r120c: straight pass model from the HUD (along-track offset S, passing distance B, relative speed U)
