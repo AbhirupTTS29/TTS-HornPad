@@ -822,6 +822,30 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
     }
 
     /**
+     * r153: the bell (down) loops the WHOLE file, the way the game itself plays a bell (idle 1.wav): a bell
+     * recording is a run of strikes, and a cut-out "steady part" of it (what findLoop picks for a horn) does not
+     * sound like a ringing bell.  Very short (5 ms) cross-fade at the seam, quick fade on release.
+     */
+    static void bellLoop(Snd s) {
+        s.loopA = 0;
+        s.loopB = s.frames;
+        s.xf = Math.max(1, Math.min(RATE * 5 / 1000, s.frames / 8));     // 5 ms: keeps the strike at the start sharp
+        double sab = 0, saa = 0, sbb = 0;
+        for (int i = 0; i < s.xf; i++) {
+            float x = s.pcm[2 * (s.frames - s.xf + i)] + s.pcm[2 * (s.frames - s.xf + i) + 1];
+            float y = s.pcm[2 * i] + s.pcm[2 * i + 1];
+            sab += x * y;
+            saa += x * x;
+            sbb += y * y;
+        }
+        s.corr = (saa > 0 && sbb > 0) ? (float) Math.max(-1, Math.min(1, sab / Math.sqrt(saa * sbb))) : 0f;
+        s.seamGain = 1f;
+        s.tailOk = false;
+        loudness(s);
+        log("bell: whole-file loop " + (s.frames * 1000 / RATE) + " ms");
+    }
+
+    /**
      * The part after the loop body is used as the release only if it really dies away: within 1.2 s its level
      * must fall below 40 % of the level where it starts, and it must not be longer than 4 s.  A bell recording
      * that just goes on ringing (or a horn file with a second blast) fails this and gets a short fade instead.
@@ -1025,6 +1049,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                         File f = byName.get(nm);
                         if (f != null) {
                             n[k] = readWav(f);
+                            if (n[k] != null && k == 3) bellLoop(n[k]);   // r153: bell loops like stock Trainz
                             if (n[k] != null) break;
                         }
                     }
