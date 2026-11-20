@@ -63,6 +63,8 @@ public final class TTSSms {
     static String loadedKuid;
     static volatile Engine eng;                  // the loaded sound set (null = nothing)
     static volatile Engine[] trk = new Engine[0]; // r139: the track sounds (.sms of the tracksound assets of the bogeys, one per kind), play with eng
+    static volatile boolean gamePaused;          // r157: the game is paused (router "World, Paused" in Trainz.log)
+    static volatile boolean nearAC;              // r156: the vehicle nearest to the camera is an AC coach (TTSNEAR)
     static String trkLine = "";                  // last TTSTRK line handled
     static long trkTry;                          // when a track sound that could not be found was tried
 
@@ -84,6 +86,8 @@ public final class TTSSms {
     /** called by the TTSHornPad watcher with every new piece of Trainz.log */
     static void fromLog(String s, File base, TTSHornPad.Watcher w) {
         trackFromLog(s, w);
+        nearFromLog(s);
+        pauseFromLog(s);
         int i = s.lastIndexOf("TTSSMS: ");
         int done = s.lastIndexOf("GSRouter::Done()");
         if (done > i) {
@@ -255,6 +259,7 @@ public final class TTSSms {
 
     static synchronized void stop() {
         running = false;
+        gamePaused = false;
         needReset = true;            // the audio thread resets the streams (never while it mixes them)
         loadedKuid = null;
     }
@@ -315,6 +320,52 @@ public final class TTSSms {
         }
     }
 
+    /** r157: the game's pause (Esc / pause button): every .sms sound stops until "World, Unpaused" */
+    static void pauseFromLog(String s) {
+        int pi = s.lastIndexOf("message World, Paused");
+        int ui = s.lastIndexOf("message World, Unpaused");
+        int di = s.lastIndexOf("GSRouter::Done()");
+        if (pi < 0 && ui < 0 && di < 0) return;
+        boolean p = pi > ui && pi > di;
+        if (p == gamePaused) return;
+        gamePaused = p;
+        TTSHornPad.log("sms: game " + (p ? "paused" : "running"));
+        if (!p) {
+            synchronized (in) {
+                in.notifyAll();
+            }
+        }
+    }
+
+    /** r156: "TTSNEAR: <vehicle name> | <username>" - the vehicle nearest to the camera */
+    static void nearFromLog(String s) {
+        int i = s.lastIndexOf("TTSNEAR: ");
+        if (i < 0) return;
+        int e = s.indexOf('\n', i);
+        if (e < 0) e = s.length();
+        String name = s.substring(i + 9, e).trim();
+        boolean ac = isAC(name);
+        if (ac != nearAC) TTSHornPad.log("near: " + name + (ac ? " = AC coach" : " = non-AC"));
+        nearAC = ac;
+    }
+
+    /**
+     * r156: an AC coach = "AC" in its name as a word of its own or with a number ("AC", "3AC", "AC3", "2-AC",
+     * "A.C."), not inside a word ("COACH") and not after "NON" ("NON AC", "NON-AC").
+     */
+    static boolean isAC(String name) {
+        String u = name.toUpperCase(Locale.US).replace("A.C.", "AC").replace("A/C", "AC");
+        String[] w = u.split("[^A-Z0-9]+");
+        for (int k = 0; k < w.length; k++) {
+            String t = w[k];
+            String core = t.replaceAll("^[0-9]+", "").replaceAll("[0-9]+$", "");
+            if (!core.equals("AC")) continue;
+            if (k > 0 && w[k - 1].equals("NON")) continue;
+            return true;
+        }
+        return false;
+    }
+
     static boolean active() {
         return running && eng != null;
     }
@@ -351,7 +402,7 @@ public final class TTSSms {
                     for (Engine rt : trk) rt.reset();
                 }
                 synchronized (in) {
-                    while (!running || paused || (eng == null && trk.length == 0)) {
+                    while (!running || paused || gamePaused || (eng == null && trk.length == 0)) {
                         if (track != null) {
                             try {
                                 track.pause();
@@ -612,13 +663,22 @@ public final class TTSSms {
             vars.cam = ci;      // 0 outside, 1 cab, 2 passenger seat
             // r154: a track sound .sms made only for the outside view (Activation ExternalCam): in the cab / a coach
             // the game's own track sound still plays, so here it plays too, heard through the body (muffled, -6 dB)
+            // r156: heard from inside: loco cab and non-AC coach (open windows) only a little quieter, an AC
+            // coach (sealed) much quieter and duller.  An .sms with its own cab / passenger streams keeps them;
+            // in an AC coach it is still taken down (also the "ac ext" .sms).
             muffleTo = 0f;
             if (isTrack && ci != 0) {
                 boolean own = false;
                 for (Source s : sources) if (ci == 1 ? s.actCab : s.actPass) own = true;
-                if (!own) {
-                    vars.cam = 0;
+                if (!own) vars.cam = 0;
+                if (ci == 2 && nearAC) {
                     muffleTo = 1f;
+                    mGainTo = own ? 0.65f : 0.35f;      // an own passenger stream is already at half (pass-through)
+                    mFc = 900f;
+                } else if (!own) {
+                    muffleTo = 1f;
+                    mGainTo = ci == 1 ? 0.75f : 0.85f;
+                    mFc = ci == 1 ? 3500f : 5000f;
                 }
             }
             // Doppler of the moving loco (OpenAL DOPPLER_FACTOR 1): range rate from the HUD, glides
@@ -637,6 +697,7 @@ public final class TTSSms {
 
         boolean isTrack;            // r154: a track sound (bogeys), not the loco
         float muffleTo, muffle, lp; // r154: 0 = open, 1 = heard through the cab / coach body
+        float mGainTo = 0.5f, mGain = 0.5f, mFc = 1400f;   // r156: gain / low-pass of that body (cab, coach, AC coach)
 
         void render(float[] acc, int n) {
             Arrays.fill(acc, 0f);
@@ -648,7 +709,8 @@ public final class TTSSms {
                 lp = 0f;
                 return;
             }
-            float a = 1f - (float) Math.exp(-2.0 * Math.PI * 1400.0 / RATE);   // one-pole low-pass 1.4 kHz
+            float a = 1f - (float) Math.exp(-2.0 * Math.PI * mFc / RATE);      // one-pole low-pass (r156: per body)
+            float gk = 10f / RATE;
             float dm = muffleTo > muffle ? 10f / RATE : muffleTo < muffle ? -10f / RATE : 0f;   // 0.1 s glide
             float m = muffle, y = lp;
             for (int i = 0; i < n; i++) {
@@ -657,7 +719,8 @@ public final class TTSSms {
                 if (m > 1f) m = 1f;
                 float x = acc[i];
                 y += a * (x - y);
-                acc[i] = x * (1f - m) + y * 0.5f * m;
+                mGain += (mGainTo - mGain) * gk;
+                acc[i] = x * (1f - m) + y * mGain * m;
             }
             muffle = m;
             lp = y;
