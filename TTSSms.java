@@ -233,7 +233,7 @@ public final class TTSSms {
 
     // ====================================================================================== start / stop
     static synchronized void start() {
-        if (eng == null) return;
+        if (eng == null && trk.length == 0) return;   // r154: a track sound plays also behind a loco without .sms
         running = true;
         if (testNs >= 0) return;
         if (th != null && th.isAlive()) {
@@ -296,6 +296,7 @@ public final class TTSSms {
                 if (dir != null && dir.isDirectory()) {
                     Engine en = Engine.open(dir);
                     if (en != null) {
+                        en.isTrack = true;
                         list.add(en);
                         what.append(' ').append(k).append(" streams=").append(en.streamCount());
                     }
@@ -307,6 +308,7 @@ public final class TTSSms {
                 synchronized (in) {
                     in.notifyAll();
                 }
+                if (inOn) start();                     // r154: the loco's own sound may be the game's (no .sms)
             }
         } catch (Throwable t) {
             TTSHornPad.log("sms track: " + t);
@@ -366,7 +368,10 @@ public final class TTSSms {
                 if (e == null && tks.length == 0) continue;
                 if (tick <= 0) {
                     int[] evs = e != null ? e.control(now(), null) : null;
-                    for (Engine tk : tks) tk.control(now(), evs);
+                    for (Engine tk : tks) {
+                        int[] got = tk.control(now(), evs);
+                        if (evs == null) evs = got;           // r154: no loco .sms - the first track sound takes the events, the rest share them
+                    }
                     tick += UPDATE_S;
                 }
                 tick -= (double) CHUNK / RATE;
@@ -508,8 +513,11 @@ public final class TTSSms {
                     }
                 } else if (low.startsWith("tts-sms ") || low.startsWith("tts-sms\t")) {
                     for (String q : t.substring(7).split("[,;]")) {
-                        String n = q.replace("\"", "").trim();
-                        if (n.length() > 0) want.add(n.toLowerCase(Locale.US));
+                        String n = q.replace("\"", "").trim().toLowerCase(Locale.US);
+                        if (n.length() == 0) continue;
+                        if (!e.byName.containsKey(n) && e.byName.containsKey(n + ".sms")) n = n + ".sms";  // r154: name given without .sms
+                        if (!e.byName.containsKey(n)) TTSHornPad.log("sms: " + dir.getName() + " config tts-sms \"" + n + "\" not in the folder");
+                        want.add(n);
                     }
                 }
             }
@@ -600,6 +608,17 @@ public final class TTSSms {
             if (d < 0f) d = 5f;
             vars.dist = d;
             vars.cam = ci;      // 0 outside, 1 cab, 2 passenger seat
+            // r154: a track sound .sms made only for the outside view (Activation ExternalCam): in the cab / a coach
+            // the game's own track sound still plays, so here it plays too, heard through the body (muffled, -6 dB)
+            muffleTo = 0f;
+            if (isTrack && ci != 0) {
+                boolean own = false;
+                for (Source s : sources) if (ci == 1 ? s.actCab : s.actPass) own = true;
+                if (!own) {
+                    vars.cam = 0;
+                    muffleTo = 1f;
+                }
+            }
             // Doppler of the moving loco (OpenAL DOPPLER_FACTOR 1): range rate from the HUD, glides
             float vr = ci == 0 ? TTSHornPad.camV : 0f;
             if (vr > 90f) vr = 90f;
@@ -614,12 +633,32 @@ public final class TTSSms {
 
         final Vars vars = new Vars();
 
+        boolean isTrack;            // r154: a track sound (bogeys), not the loco
+        float muffleTo, muffle, lp; // r154: 0 = open, 1 = heard through the cab / coach body
+
         void render(float[] acc, int n) {
             Arrays.fill(acc, 0f);
             float mv = masterVol * volume * MASTER;
             for (Source s : sources)
                 for (Stream st : s.streams)
                     if (st.al != null) st.al.render(acc, n, mv, dopp);
+            if (muffle == 0f && muffleTo == 0f) {
+                lp = 0f;
+                return;
+            }
+            float a = 1f - (float) Math.exp(-2.0 * Math.PI * 1400.0 / RATE);   // one-pole low-pass 1.4 kHz
+            float dm = muffleTo > muffle ? 10f / RATE : muffleTo < muffle ? -10f / RATE : 0f;   // 0.1 s glide
+            float m = muffle, y = lp;
+            for (int i = 0; i < n; i++) {
+                if ((dm > 0 && m < muffleTo) || (dm < 0 && m > muffleTo)) m += dm;
+                if (m < 0f) m = 0f;
+                if (m > 1f) m = 1f;
+                float x = acc[i];
+                y += a * (x - y);
+                acc[i] = x * (1f - m) + y * 0.5f * m;
+            }
+            muffle = m;
+            lp = y;
         }
     }
 
