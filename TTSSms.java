@@ -2020,7 +2020,6 @@ public final class TTSSms {
         int[] lens;
         int rate;
         boolean valid, single;
-        int nextBuffer;
 
         static Piece make(String name, Wav w) {
             Piece p = new Piece();
@@ -2078,19 +2077,24 @@ public final class TTSSms {
             for (ABuf b : ids) if (b != null) s.queue(b);
         }
 
-        void queue2(Src s) {
+        // r159: the loop position (NextBuffer) belongs to the sound item, not to the shared piece.  The same wav
+        // is often used by the cab and the outside .sms (and by several streams); with one shared counter the
+        // other source's start put it back to 0 every time, so a cue-point loop restarted from its beginning
+        // every first slice (XD.wav sander: a cut every 0.45 s).
+        void queue2(Src s, Item it) {
             if (!valid) return;
-            if (ids[nextBuffer] != null) s.queue(ids[nextBuffer]);
+            if (it.nb < 0 || it.nb >= ids.length) it.nb = 0;
+            if (ids[it.nb] != null) s.queue(ids[it.nb]);
             if (ids.length > 1) {
-                nextBuffer++;
-                nextBuffer %= ids.length - 1;
-                if (nextBuffer == 0) nextBuffer++;
+                it.nb++;
+                it.nb %= ids.length - 1;
+                if (it.nb == 0) it.nb++;
             }
         }
 
-        void queue3(Src s) {
+        void queue3(Src s, Item it) {
             if (valid && !single && ids[ids.length - 1] != null) s.queue(ids[ids.length - 1]);
-            nextBuffer = 0;
+            it.nb = 0;
         }
 
         /** SoundPiece.IsCheckpoint: within the last 0.2 s (times pitch) of the buffer being played */
@@ -2114,6 +2118,7 @@ public final class TTSSms {
         int mode;
         int state;
         float pitch;
+        int nb;            // r159: SoundPiece.NextBuffer, per item
 
         void setPiece(String name, boolean relJump, Engine e) {
             if (name == null || name.length() == 0) return;
@@ -2134,17 +2139,17 @@ public final class TTSSms {
         /** SoundItem.Update: keeps the loop going; false = leave it (release) */
         boolean update(Src s, float pitch) {
             this.pitch = pitch;
-            if (mode == M_REL && piece.nextBuffer < 2 || mode == M_RELJUMP) return false;
+            if (mode == M_REL && nb < 2 || mode == M_RELJUMP) return false;
             if (s != null) {
                 ABuf b = s.buffer();
                 if (b == null) {
-                    if (s.q.size() == 0) piece.queue2(s);
+                    if (s.q.size() == 0) piece.queue2(s, this);
                     s.play();
                 } else if (piece.isCheckpoint(s, b, pitch)) {
-                    if (s.q.size() < 2) piece.queue2(s);
+                    if (s.q.size() < 2) piece.queue2(s, this);
                 }
             }
-            if (mode == M_REL && piece.nextBuffer < 2) return false;
+            if (mode == M_REL && nb < 2) return false;
             return true;
         }
 
@@ -2156,8 +2161,8 @@ public final class TTSSms {
                     state = S_PLAYING;
                     break;
                 case M_LOOPREL:
-                    piece.nextBuffer = 0;
-                    if (s != null) piece.queue2(s);
+                    nb = 0;
+                    if (s != null) piece.queue2(s, this);
                     state = S_PLAYING;
                     break;
                 default:
@@ -2168,7 +2173,7 @@ public final class TTSSms {
 
         void leaveItemPlay(Src s) {
             if (mode == M_RELJUMP || mode == M_REL) {
-                if (s != null) piece.queue3(s);
+                if (s != null) piece.queue3(s, this);
                 state = S_NOP;
             }
         }

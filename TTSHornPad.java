@@ -30,6 +30,9 @@ import android.widget.FrameLayout;
 
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
 import java.io.RandomAccessFile;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.InvocationTargetException;
@@ -77,7 +80,73 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         } catch (Throwable t) {
             log("onCreate: " + t);
         }
+        installAddons(app);
         return true;
+    }
+
+    // r159: TTS built-in addons (assets/tts_addons/hash-XX/<asset folder>/...) are put once per version into
+    // Android/media/<pkg>/Addons/hash-XX/, before the game starts; the loader's own addon import moves them into
+    // UserData/original and asks the engine for its database update, exactly like an addon the player adds.
+    static final String ADDONS_VER = "r159-door1";
+
+    static void installAddons(Context c) {
+        if (c == null) return;
+        try {
+            SharedPreferences sp = c.getSharedPreferences("tts_addons", Context.MODE_PRIVATE);
+            android.content.res.AssetManager am = c.getAssets();
+            String[] hashes = am.list("tts_addons");
+            if (hashes == null || hashes.length == 0) return;
+            File media = null;
+            try {
+                File[] m = c.getExternalMediaDirs();
+                if (m != null && m.length > 0) media = m[0];
+            } catch (Throwable t) {
+                // old Android
+            }
+            if (media == null) media = new File("/sdcard/Android/media/" + c.getPackageName());
+            for (String h : hashes) {
+                String[] assets = am.list("tts_addons/" + h);
+                if (assets == null) continue;
+                for (String a : assets) {
+                    String key = h + "/" + a;
+                    if (ADDONS_VER.equals(sp.getString(key, ""))) continue;     // once per TTS version
+                    File dst = new File(new File(new File(media, "Addons"), h), a);
+                    int n = copyAssetDir(am, "tts_addons/" + key, dst);
+                    if (n > 0) {
+                        sp.edit().putString(key, ADDONS_VER).apply();
+                        log("addon " + key + ": " + n + " files -> " + dst);
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            log("addons: " + t);
+        }
+    }
+
+    static int copyAssetDir(android.content.res.AssetManager am, String path, File dst) throws IOException {
+        String[] kids = am.list(path);
+        if (kids == null || kids.length == 0) {
+            File parent = dst.getParentFile();
+            if (parent != null) parent.mkdirs();
+            InputStream in = am.open(path);
+            try {
+                FileOutputStream out = new FileOutputStream(dst);
+                try {
+                    byte[] b = new byte[16384];
+                    int r;
+                    while ((r = in.read(b)) > 0) out.write(b, 0, r);
+                } finally {
+                    out.close();
+                }
+            } finally {
+                in.close();
+            }
+            return 1;
+        }
+        int n = 0;
+        dst.mkdirs();
+        for (String k : kids) n += copyAssetDir(am, path + "/" + k, new File(dst, k));
+        return n;
     }
 
     @Override public Cursor query(Uri u, String[] p, String s, String[] a, String o) { return null; }
