@@ -2404,7 +2404,10 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         volatile int[] prof;                  // here + 20 columns (dm), Integer.MIN_VALUE = no data
         volatile String[] lights;             // TTSHL fields
         volatile String[] msts;               // r166: TTSMS fields (MSTS vehicles of the driven train)
-        int cpPage;                           // r166: CONTROL PANEL page, 0 LIGHTS / 1 LOCO
+        int cpPage;                           // r166: CONTROL PANEL page, 0 LIGHTS / 1 LOCO / 2 POINTS (r171)
+        volatile int[] swDist = new int[0], swDir = new int[0];   // r171: TTSSW junctions ahead
+        long swUntil[] = new long[5];
+        int swWant[] = new int[5];
         long msUntil[] = new long[6], hmUntil;
         boolean msWant[] = new boolean[6];
         int hmWant;
@@ -2523,6 +2526,20 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                     changed = true;
                 }
             }
+            l = lineAfter(s, "TTSSW: ");
+            if (l != null && s.lastIndexOf("TTSSW: ") > done && !l.startsWith("junction")) {
+                String[] f = split(l.trim(), '^');
+                int n = Math.max(0, Math.min(5, num(f[0], 0)));
+                int[] ds = new int[n], dr = new int[n];
+                for (int i = 0; i < n && 2 + 2 * i < f.length; i++) {
+                    ds[i] = num(f[1 + 2 * i], 0);
+                    dr[i] = num(f[2 + 2 * i], -1);
+                    if (swUntil[i] != 0 && dr[i] == swWant[i]) swUntil[i] = 0;
+                }
+                swDist = ds;
+                swDir = dr;
+                changed = true;
+            }
             l = lineAfter(s, "TTSMS: ");
             if (l != null && s.lastIndexOf("TTSMS: ") > done) {
                 String[] f = split(l, '^');
@@ -2551,6 +2568,15 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         int msN(int i) {
             String[] f = msts;
             return f != null && f.length > i ? num(f[i], 0) : 0;
+        }
+
+        /** r171: setting of junction i ahead (0 left / 1 forward / 2 right, -1 unknown) */
+        int sw(int i) {
+            int[] d = swDir;
+            int gs = i < d.length ? d[i] : -1;
+            if (i < 5 && swUntil[i] != 0 && System.currentTimeMillis() < swUntil[i]) return swWant[i];
+            if (i < 5) swUntil[i] = 0;
+            return gs;
         }
 
         /** r166: headlight 0 off / 1 dim / 2 bright */
@@ -2666,7 +2692,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 compact = sp.getBoolean("compact", false);
                 lightsOn = sp.getBoolean("lightsOn", true);
                 hideAll = sp.getBoolean("hideAll", false);
-                cpPage = sp.getInt("cpPage", 0) == 1 ? 1 : 0;
+                cpPage = Math.max(0, Math.min(2, sp.getInt("cpPage", 0)));
             } catch (Throwable e) {
                 log("hud prefs: " + e);
             }
@@ -2887,10 +2913,25 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 case 21:
                     Hud.send(21);
                     break;
-                case 50:      // r166: CONTROL PANEL tabs
+                case 50:      // r166: CONTROL PANEL tabs (r171: + POINTS, CAM)
                 case 51:
+                case 52:
                     h.cpPage = a - 50;
                     break;
+                case 40:      // r171: throw a junction ahead
+                case 41:
+                case 42:
+                case 43:
+                case 44: {
+                    int i = a - 40;
+                    int[] dd = h.swDir;
+                    if (i < dd.length) {
+                        h.swWant[i] = dd[i] == 0 ? 2 : 0;
+                        h.swUntil[i] = now + 2000;
+                    }
+                    Hud.send(a);
+                    break;
+                }
                 case 30:      // r166: MSTS parts (pantographs, doors, wiper, mirror)
                 case 31:
                 case 32:
@@ -3385,6 +3426,44 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             }
         }
 
+        /** r171: POINTS - the junctions ahead, tap = throw (LEFT / RIGHT chip shows the setting) */
+        void drawPoints(Canvas c, Hud h, float L, float y, float panelW, float rh, float step, float sec, float fs, float fsSmall) {
+            section(c, "POINTS AHEAD", L, y, panelW, fsSmall);
+            y += sec;
+            int[] ds = h.swDist;
+            if (ds.length == 0) {
+                text(c, "No points within 2.5 km", L + 12 * sc, y + (rh - fs) / 2, fs * 0.9f, 0xFF93A7C2, false, panelW - 24 * sc);
+                y += step;
+            }
+            for (int i = 0; i < ds.length; i++) {
+                int d = h.sw(i);
+                box(c, L + 6 * sc, y, panelW - 12 * sc, rh, 0xF0162440);
+                box(c, L + 6 * sc, y, 4 * sc, rh, 0xFFFF8A1E);
+                String dist = ds[i] < 1000 ? ds[i] + " m" : (ds[i] / 100) / 10f + " km";
+                text(c, (i + 1) + ".  " + dist, L + 16 * sc, y + (rh - fs) / 2, fs * 0.92f, 0xFFFFFFFF, false, panelW * 0.45f);
+                float cw = rh * 2.9f, ch = rh * 0.64f;
+                float cx = L + panelW - cw - 12 * sc, cy = y + (rh - ch) / 2;
+                p.setStyle(Paint.Style.FILL);
+                p.setColor(0xFF0B1322);
+                r.set(cx, cy, cx + cw, cy + ch);
+                c.drawRoundRect(r, ch / 2, ch / 2, p);
+                float half = cw / 2;
+                boolean right = d == 2, fwd = d == 1;
+                p.setColor(fwd ? 0xFF8A97AD : 0xFF38E07B);
+                float hx = right ? cx + half : cx;
+                if (fwd) hx = cx + half / 2;
+                r.set(hx + 2 * sc, cy + 2 * sc, hx + half - 2 * sc, cy + ch - 2 * sc);
+                c.drawRoundRect(r, ch / 2, ch / 2, p);
+                float ts = Math.min(fsSmall * 0.82f, ch * 0.52f);
+                text(c, "LEFT", cx + half * 0.18f, cy + (ch - ts) / 2, ts, d == 0 ? 0xFF10202E : 0xFF8A97AD, true, 0);
+                text(c, "RIGHT", cx + half + half * 0.12f, cy + (ch - ts) / 2, ts, d == 2 ? 0xFF10202E : 0xFF8A97AD, true, 0);
+                hit(L, y, L + panelW, y + rh, 40 + i);
+                y += step;
+            }
+            y += 2 * sc;
+            text(c, "Direction of travel. Tap a row to throw it.", L + 8 * sc, y, fsSmall, 0xFF93A7C2, false, panelW - 16 * sc);
+        }
+
         void drawLoco(Canvas c, Hud h, float L, float y, float panelW, float rh, float step, float sec, float fs, float fsSmall) {
             section(c, "HEADLIGHT", L, y, panelW, fsSmall);
             y += sec;
@@ -3443,7 +3522,9 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         void drawLights(Canvas c, Hud h, int side, float ppi, float fs, float fsSmall, float rowH, float W, float Hh) {
             float step = rowH + 14 * sc, panelW = 1.12f * ppi, rh = step - 4 * sc, sec = fsSmall * 1.9f;
             float tabH = rh * 0.85f + 8 * sc;
-            float bodyH = h.cpPage == 1 ? locoH(h, step, sec, rowH) : 8 * step + 3 * sec + 1.3f * rowH + 4 * sc;
+            float bodyH = h.cpPage == 1 ? locoH(h, step, sec, rowH)
+                    : h.cpPage == 2 ? sec + Math.max(1, h.swDist.length) * step + 1.3f * rowH + 4 * sc
+                    : 8 * step + 3 * sec + 1.3f * rowH + 4 * sc;
             bodyH += tabH;
             float panelH = h.lightsOn ? rowH + 8 * sc + bodyH : rowH + 8 * sc;
             float top = Hh * 0.22f;
@@ -3470,16 +3551,21 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             if (!h.lightsOn) return;
             float y = top + rowH + 12 * sc;
             // r166: page tabs LIGHTS | LOCO
-            float tw = (panelW - 12 * sc) / 2f, th = rh * 0.85f;
-            for (int t = 0; t < 2; t++) {
+            float tw = (panelW - 12 * sc) / 3f, th = rh * 0.85f;
+            String[] tabs = {"LIGHTS", "LOCO", "POINTS"};
+            for (int t = 0; t < 3; t++) {
                 boolean sel = h.cpPage == t;
                 float tx = L + 6 * sc + t * tw;
                 box(c, tx + 1 * sc, y, tw - 2 * sc, th, sel ? 0xF024406E : 0xF0101C30);
                 if (sel) box(c, tx + 1 * sc, y + th - 3 * sc, tw - 2 * sc, 3 * sc, 0xFFFF8A1E);
-                textC(c, t == 0 ? "LIGHTS" : "LOCO", tx, y, tw, th, fsSmall, sel ? 0xFFFFB733 : 0xFF8A97AD, true);
+                textC(c, tabs[t], tx, y, tw, th, Math.min(fsSmall, tw / 4.2f), sel ? 0xFFFFB733 : 0xFF8A97AD, true);
                 hit(tx, y, tx + tw, y + th, 50 + t);
             }
             y += th + 8 * sc;
+            if (h.cpPage == 2) {
+                drawPoints(c, h, L, y, panelW, rh, step, sec, fs, fsSmall);
+                return;
+            }
             if (h.cpPage == 1) {
                 drawLoco(c, h, L, y, panelW, rh, step, sec, fs, fsSmall);
                 return;
