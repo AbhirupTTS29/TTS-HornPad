@@ -95,6 +95,14 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
     public void onActivityResumed(Activity a) {
         try {
             if (!GAME.equals(a.getClass().getName())) return;
+            if (a == owner) {
+                // r158: sound back on first: a resume that the intro / login check turned back early (system
+                // dialog of the screen recorder, notification shade) left every TTS sound paused for good
+                weather.setPaused(false);
+                hiss.setPaused(false);
+                squeal.setPaused(false);
+                TTSSms.setPaused(false);
+            }
             final Activity fa = a;                         // r145b: intro overlay first, then this same start again
             if (!TTSIntro.check(a, new Runnable() {
                 public void run() {
@@ -623,6 +631,40 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         float norm = 1f;   // r123: brings the steady body to the same loudness for every horn file
     }
 
+    static float herm(float[] x, int a, float t, int n) {
+        float sm = x[Math.max(0, Math.min(n - 1, a - 1))], s0 = x[Math.max(0, Math.min(n - 1, a))];
+        float s1 = x[Math.max(0, Math.min(n - 1, a + 1))], s2 = x[Math.max(0, Math.min(n - 1, a + 2))];
+        float c1 = 0.5f * (s1 - sm), c2 = sm - 2.5f * s0 + 2f * s1 - 0.5f * s2, c3 = 0.5f * (s2 - sm) + 1.5f * (s0 - s1);
+        return ((c3 * t + c2) * t + c1) * t + s0;
+    }
+
+    /** r158: runs of 2+ samples stuck at full scale rebuilt with a cubic through the neighbours; returns runs fixed */
+    static int declip(float[] x) {
+        int n = x.length, runs = 0, i = 2;
+        while (i < n - 3) {
+            if (Math.abs(x[i]) >= 0.995f) {
+                int a = i, b = i;
+                float sg = Math.signum(x[i]);
+                while (b + 1 < n - 3 && Math.abs(x[b + 1]) >= 0.995f && Math.signum(x[b + 1]) == sg) b++;
+                if (b > a) {
+                    int L = b - a + 2;
+                    float p0 = x[a - 1], p1 = x[b + 1];
+                    float m0 = (x[a - 1] - x[a - 2]) * L, m1 = (x[b + 2] - x[b + 1]) * L;
+                    for (int k = a; k <= b; k++) {
+                        float t = (float) (k - (a - 1)) / L, t2 = t * t, t3 = t2 * t;
+                        float y = (2 * t3 - 3 * t2 + 1) * p0 + (t3 - 2 * t2 + t) * m0 + (-2 * t3 + 3 * t2) * p1 + (t3 - t2) * m1;
+                        if (sg > 0 && y < x[k]) y = x[k];
+                        if (sg < 0 && y > x[k]) y = x[k];
+                        x[k] = Math.max(-1.6f, Math.min(1.6f, y));
+                    }
+                    runs++;
+                }
+                i = b + 1;
+            } else i++;
+        }
+        return runs;
+    }
+
     static Snd readWav(File f) {
         try {
             if (f == null || !f.isFile() || f.length() > (40L << 20)) return null;
@@ -671,7 +713,19 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 L[i] = sample(b, q, fmt, bits);
                 R[i] = ch > 1 ? sample(b, q + bps, fmt, bits) : L[i];
             }
-            // resample to 44.1 kHz (linear)
+            // r158: a clipped (flat-topped) recording crackles on a phone speaker: rebuild the peaks, -3 dB
+            int cl = declip(L) + declip(R);
+            if (cl > 0) {
+                float pk = 0f;
+                for (int i = 0; i < inFrames; i++) pk = Math.max(pk, Math.max(Math.abs(L[i]), Math.abs(R[i])));
+                float g = Math.min(0.708f, 0.98f / Math.max(pk, 1e-6f));
+                for (int i = 0; i < inFrames; i++) {
+                    L[i] *= g;
+                    R[i] *= g;
+                }
+                log("wav " + f.getName() + ": " + cl + " clipped peaks rebuilt, x" + String.format(java.util.Locale.US, "%.2f", g));
+            }
+            // resample to 44.1 kHz (r158: 4-point Hermite, was linear - less harsh)
             int outFrames = (int) ((long) inFrames * RATE / rate);
             if (outFrames < 16) return null;
             Snd s = new Snd();
@@ -682,10 +736,8 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 double x = i * step;
                 int a = (int) x;
                 float t = (float) (x - a);
-                int c = Math.min(a + 1, inFrames - 1);
-                a = Math.min(a, inFrames - 1);
-                s.pcm[2 * i] = clip(L[a] + (L[c] - L[a]) * t);
-                s.pcm[2 * i + 1] = clip(R[a] + (R[c] - R[a]) * t);
+                s.pcm[2 * i] = clip(herm(L, a, t, inFrames));
+                s.pcm[2 * i + 1] = clip(herm(R, a, t, inFrames));
             }
             findLoop(s);
             loudness(s);
@@ -1184,7 +1236,16 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                         continue;
                     }
                     if (track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING) track.play();
-                    track.write(out, 0, out.length);
+                    if (track.write(out, 0, out.length) < 0 || track.getState() != AudioTrack.STATE_INITIALIZED) {
+                        // r158: a dead output (screen recorder, call, route change) swallows everything silently: new track
+                        log("audio: track lost, new one");
+                        try {
+                            track.release();
+                        } catch (Throwable tl) {
+                            // gone
+                        }
+                        track = null;
+                    }
                     idle = 1;
                 } catch (Throwable t) {
                     log("audio: " + t);
@@ -1331,7 +1392,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 int min = AudioTrack.getMinBufferSize(RATE, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT);
                 if (min <= 0) min = 4096;
                 return new AudioTrack(AudioManager.STREAM_MUSIC, RATE, AudioFormat.CHANNEL_OUT_STEREO,
-                        AudioFormat.ENCODING_PCM_16BIT, Math.max(min, 2048), AudioTrack.MODE_STREAM);
+                        AudioFormat.ENCODING_PCM_16BIT, Math.max(min, RATE * 4 * 60 / 1000), AudioTrack.MODE_STREAM);   // r158: 60 ms (was ~12): no underrun crackle
             } catch (Throwable t) {
                 log("track: " + t);
                 return null;
@@ -1465,7 +1526,16 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                         continue;
                     }
                     if (track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING) track.play();
-                    track.write(out, 0, out.length);
+                    if (track.write(out, 0, out.length) < 0 || track.getState() != AudioTrack.STATE_INITIALIZED) {
+                        // r158: a dead output (screen recorder, call, route change) swallows everything silently: new track
+                        log("audio: track lost, new one");
+                        try {
+                            track.release();
+                        } catch (Throwable tl) {
+                            // gone
+                        }
+                        track = null;
+                    }
                 } catch (Throwable t) {
                     TTSHornPad.log("hiss audio: " + t);
                     try {
@@ -1640,7 +1710,16 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                         continue;
                     }
                     if (track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING) track.play();
-                    track.write(out, 0, out.length);
+                    if (track.write(out, 0, out.length) < 0 || track.getState() != AudioTrack.STATE_INITIALIZED) {
+                        // r158: a dead output (screen recorder, call, route change) swallows everything silently: new track
+                        log("audio: track lost, new one");
+                        try {
+                            track.release();
+                        } catch (Throwable tl) {
+                            // gone
+                        }
+                        track = null;
+                    }
                 } catch (Throwable t) {
                     TTSHornPad.log("squeal audio: " + t);
                     try {
@@ -1759,7 +1838,16 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                         continue;
                     }
                     if (track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING) track.play();
-                    track.write(out, 0, out.length);
+                    if (track.write(out, 0, out.length) < 0 || track.getState() != AudioTrack.STATE_INITIALIZED) {
+                        // r158: a dead output (screen recorder, call, route change) swallows everything silently: new track
+                        log("audio: track lost, new one");
+                        try {
+                            track.release();
+                        } catch (Throwable tl) {
+                            // gone
+                        }
+                        track = null;
+                    }
                 } catch (Throwable t) {
                     TTSHornPad.log("weather audio: " + t);
                     try {
@@ -2907,10 +2995,14 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             int[] p = new int[pick.size()];
             for (int i = 0; i < p.length; i++) p[i] = pick.get(i);
             java.util.Arrays.sort(p);
-            if (!java.util.Arrays.equals(p, picks)) {
+            // r158: a new hint session at most every 30 s (r126 made a new one each time the busiest set changed,
+            // every 2-4 s, which itself costs and kept the clocks jumping)
+            long nowMs = System.currentTimeMillis();
+            if (!java.util.Arrays.equals(p, picks) && (session == null || nowMs - sessionAt > 30000)) {
                 picks = p;
                 endSession();
                 startSession();
+                sessionAt = nowMs;
             }
         }
 
@@ -2946,12 +3038,37 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             }
         }
 
+        long sessionAt;
+        int thermal;              // r158: PowerManager thermal status (0 none .. 6 shutdown)
+        long thermalAt;
+
+        int thermalStatus() {
+            long now = System.currentTimeMillis();
+            if (now - thermalAt < 5000) return thermal;
+            thermalAt = now;
+            try {
+                if (android.os.Build.VERSION.SDK_INT >= 29 && app != null) {
+                    Object pm = app.getSystemService("power");
+                    int st = (Integer) pm.getClass().getMethod("getCurrentThermalStatus").invoke(pm);
+                    if (st != thermal) log("boost: thermal status " + thermal + " -> " + st);
+                    thermal = st;
+                }
+            } catch (Throwable t) {
+                // no thermal API
+            }
+            return thermal;
+        }
+
         void hint() {
             Object s = session;
             if (s == null || report == null) return;
             try {
-                // saturated: "the work took longer than the target" -> the phone raises the clocks
-                long actual = busy > 0.85f ? TARGET_NS * 3 / 2 : TARGET_NS * 9 / 10;
+                // saturated: "the work took longer than the target" -> the phone raises the clocks.
+                // r158: only when really saturated, and never once the phone is warm (thermal status MODERATE+):
+                // then "the work fits" so the clocks can come down - pushing a hot phone only heats it more and
+                // ends in heavier throttling (lag that grows with play time)
+                int th = thermalStatus();
+                long actual = (th < 2 && busy > 0.92f) ? TARGET_NS * 5 / 4 : TARGET_NS * 4 / 5;
                 report.invoke(s, actual);
             } catch (Throwable e) {
                 endSession();

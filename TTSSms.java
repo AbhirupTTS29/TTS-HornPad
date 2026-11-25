@@ -51,6 +51,7 @@ public final class TTSSms {
     static float inB;                             // dynamic brake 0..1
     static float inCF;                            // curve force (N)
     static int inP = -1, inMR = -1, inBP = -1, inRV = -9999, inTB = -1, inLB = -1;
+    static int inBC = -1;                         // r158: brake cylinder pressure x10 (HUD "bc="), -1 = not sent
     static boolean inDcc;
     static final int[] evq = new int[64];
     static int evH, evT;
@@ -118,7 +119,7 @@ public final class TTSSms {
         long now = now();
         synchronized (in) {
             float v = inV, f = inF, t = inT, b = inB, cf = inCF, gt = -1f;
-            int pp = inP, mr = inMR, bp = inBP, rv = inRV, tb = inTB, lb = inLB;
+            int pp = inP, mr = inMR, bp = inBP, rv = inRV, tb = inTB, lb = inLB, bc = inBC;
             boolean dcc = false;
             for (int k = 1; k < p.length; k++) {
                 String a = p[k];
@@ -140,6 +141,7 @@ public final class TTSSms {
                 else if (key.equals("p")) pp = val;
                 else if (key.equals("mr")) mr = val;
                 else if (key.equals("bp")) bp = val;
+                else if (key.equals("bc")) bc = val;
                 else if (key.equals("rv")) rv = val;
                 else if (key.equals("tb")) tb = val;
                 else if (key.equals("lb")) lb = val;
@@ -166,6 +168,7 @@ public final class TTSSms {
             inP = pp;
             inMR = mr;
             inBP = bp;
+            inBC = bc;
             inRV = rv;
             inTB = tb;
             inLB = lb;
@@ -176,7 +179,14 @@ public final class TTSSms {
                 mrRise = 0;
                 bpRise = 0;
                 // the loco is there and powered (Open Rails: EnginePowerOn), compressor resting (CompressorOff)
-                if (pp != 0) post(23);
+                cancelLater();
+                if (pp != 0) {
+                    post(23);
+                    // r158: a powered electric loco starts with its circuit breaker closed: the idling (blower /
+                    // auxiliaries) loop of the .sms (CircuitBreakerClosed 152) runs from the start
+                    post(157);
+                    post(152);
+                }
                 post(13);
             }
         }
@@ -197,7 +207,15 @@ public final class TTSSms {
             if (pp > 0 && inP == 0) {
                 post(45);            // Pantograph1Up
                 post(23);            // EnginePowerOn
+                // r158: Open Rails electric loco power-up: the circuit breaker gets its closing authorisation,
+                // closes after the pantograph is up (blower start sound, then the idling blower / auxiliaries loop)
+                post(157);           // CircuitBreakerClosingAuthorizationOn
+                later(151, 2.0);     // CircuitBreakerClosing
+                later(152, 3.5);     // CircuitBreakerClosed
             } else if (pp == 0 && inP > 0) {
+                cancelLater();
+                post(150);           // CircuitBreakerOpen  (auxiliaries / idle loop released)
+                post(158);           // CircuitBreakerClosingAuthorizationOff
                 post(46);            // Pantograph1Down
                 post(24);            // EnginePowerOff
             }
@@ -211,20 +229,127 @@ public final class TTSSms {
                 if (mrRise == 0) post(13);   // CompressorOff
             }
         }
-        if (bp >= 0 && inBP >= 0) {          // brake pipe filling = train brake released
-            if (bp > inBP + 1) {
-                if (bpRise == 0) post(14);   // TrainBrakePressureIncrease
-                bpRise = 3;
-            } else if (bpRise > 0) {
-                bpRise--;
-                if (bpRise == 0) post(139);  // TrainBrakePressureStoppedChanging
-            }
-        }
+        // r158: brake events now from brakeTick() (brake cylinder / brake pipe, Open Rails rules)
         if (rv != inRV && inRV != -9999) post(15);                       // ReverserChange
         if (lastThr >= 0f && Math.abs(t - lastThr) > 0.004f) post(16);   // ThrottleChange
         lastThr = t;
         if (tb != inTB && inTB >= 0) post(17);                           // TrainBrakeChange
         if (lb != inLB && inLB >= 0) post(18);                           // EngineBrakeChange
+    }
+
+    // r158: Open Rails AirSinglePipe sound events, checked every 0.5 s on a change of more than a step:
+    // brake CYLINDER rising 14 TrainBrakePressureIncrease, falling 54 ..Decrease, steady again 139 ..StoppedChanging;
+    // brake PIPE rising 141, falling 142, steady 143.  Without a cylinder value (DCC mode, or the loco does not
+    // give "brake-cylinder-pressure") the cylinder is modelled from the braking: deceleration with no throttle
+    // fills it (about 3 s, like a real wagon cylinder), it empties when the braking ends.
+    static float cylP, cylPrev = -1f, pipePrev = -1f;
+    static double brkT;
+    static boolean cylChanging, pipeChanging;
+    static long brkLast;
+
+    // r158: events that come a moment later (circuit breaker closing after the pantograph)
+    static final int[] lateEv = new int[8];
+    static final long[] lateAt = new long[8];
+    static int lateN;
+
+    static void later(int ev, double s) {
+        if (lateN >= lateEv.length) return;
+        lateEv[lateN] = ev;
+        lateAt[lateN] = now() + (long) (s * 1e9);
+        lateN++;
+    }
+
+    static void cancelLater() {
+        lateN = 0;
+    }
+
+    // r158: loco (independent) brake: Open Rails EngineBrakePressureIncrease 21 / Decrease 22 / StoppedChanging 140
+    static float engCyl, engPrev = -1f;
+    static boolean engChanging;
+
+    static void brakeTick(long now) {
+        for (int i = 0; i < lateN; i++) {
+            if (now >= lateAt[i]) {
+                post(lateEv[i]);
+                for (int k = i + 1; k < lateN; k++) {
+                    lateEv[k - 1] = lateEv[k];
+                    lateAt[k - 1] = lateAt[k];
+                }
+                lateN--;
+                i--;
+            }
+        }
+        if (!inOn) {
+            cylPrev = pipePrev = engPrev = -1f;
+            cylP = engCyl = 0f;
+            engChanging = false;
+            cylChanging = pipeChanging = false;
+            brkLast = 0;
+            return;
+        }
+        double dt = brkLast == 0 ? 0.0 : (now - brkLast) / 1e9;
+        brkLast = now;
+        if (dt > 0.5) dt = 0.5;
+        float target;
+        boolean real = inBC > 0 && !inDcc;
+        if (real) {
+            cylP = inBC / 10f;                     // the game's value
+        } else {
+            float a = inSlope;                     // m/s2, minus = slowing down
+            float sp = currentSpeed(now);
+            target = (sp > 0.2f && inT < 0.02f && a < -0.12f) ? Math.min(1f, -a / 0.9f) * 50f : 0f;
+            float tau = target > cylP ? 1.2f : 2.0f;
+            cylP += (target - cylP) * (float) Math.min(1.0, dt / tau);
+        }
+        if (inLB >= 0) {
+            float tgt = inLB / 10f * 50f;
+            engCyl += (tgt - engCyl) * (float) Math.min(1.0, dt / 1.0);
+        }
+        brkT += dt;
+        if (brkT < 0.5) return;
+        brkT = 0;
+        if (inLB >= 0) {
+            if (engPrev >= 0f) {
+                if (Math.abs(engCyl - engPrev) > 0.6f) {
+                    if (!engChanging) {
+                        post(engCyl > engPrev ? 21 : 22);
+                        engChanging = true;
+                    }
+                } else if (engChanging) {
+                    engChanging = false;
+                    post(140);
+                }
+            }
+            engPrev = engCyl;
+        }
+        if (cylPrev >= 0f) {
+            float step = real ? 0.25f : 0.6f;
+            if (Math.abs(cylP - cylPrev) > step) {
+                if (!cylChanging) {
+                    post(cylP > cylPrev ? 14 : 54);
+                    cylChanging = true;
+                }
+            } else if (cylChanging) {
+                cylChanging = false;
+                post(139);
+            }
+        }
+        cylPrev = cylP;
+        if (inBP > 0 && !inDcc) {
+            float bp = inBP / 10f;
+            if (pipePrev >= 0f) {
+                if (Math.abs(bp - pipePrev) > 0.25f) {
+                    if (!pipeChanging) {
+                        post(bp > pipePrev ? 141 : 142);
+                        pipeChanging = true;
+                    }
+                } else if (pipeChanging) {
+                    pipeChanging = false;
+                    post(143);
+                }
+            }
+            pipePrev = bp;
+        }
     }
 
     static float currentSpeed(long now) {
@@ -299,11 +424,16 @@ public final class TTSSms {
                 seen.add(k);
                 File dir = w.findDir(k);
                 if (dir != null && dir.isDirectory()) {
-                    Engine en = Engine.open(dir);
-                    if (en != null) {
+                    // r158: a folder with an AC .sms ("ac" in its name) and a non-AC one: both, the coach next to
+                    // the camera decides which plays; else the listed .sms as before
+                    Engine na = Engine.open(dir, 0), ac = Engine.open(dir, 1);
+                    Engine[] got = (na != null && ac != null) ? new Engine[]{na, ac} : new Engine[]{Engine.open(dir)};
+                    for (Engine en : got) {
+                        if (en == null) continue;
+                        if (got.length == 1) en.acRole = -1;
                         en.isTrack = true;
                         list.add(en);
-                        what.append(' ').append(k).append(" streams=").append(en.streamCount());
+                        what.append(' ').append(k).append(en.acRole == 1 ? " AC" : en.acRole == 0 ? " non-AC" : "").append(" streams=").append(en.streamCount());
                     }
                 }
             }
@@ -344,7 +474,9 @@ public final class TTSSms {
         int e = s.indexOf('\n', i);
         if (e < 0) e = s.length();
         String name = s.substring(i + 9, e).trim();
-        boolean ac = isAC(name);
+        // r158: an AC coach is one whose config description says "use ac.sms" (HUD: acsms=1), not a name with AC
+        // in it (that made locos and AC EMU / local trains play the AC sound set too)
+        boolean ac = name.contains("acsms=1");
         if (ac != nearAC) TTSHornPad.log("near: " + name + (ac ? " = AC coach" : " = non-AC"));
         nearAC = ac;
     }
@@ -418,11 +550,17 @@ public final class TTSSms {
                 Engine[] tks = trk;
                 if (e == null && tks.length == 0) continue;
                 if (tick <= 0) {
-                    int[] evs = e != null ? e.control(now(), null) : null;
-                    for (Engine tk : tks) {
-                        int[] got = tk.control(now(), evs);
-                        if (evs == null) evs = got;           // r154: no loco .sms - the first track sound takes the events, the rest share them
+                    long tn = now();
+                    int[] evs;
+                    synchronized (in) {
+                        brakeTick(tn);                        // r158
+                        int n = evH - evT;
+                        evs = new int[n];
+                        for (int i = 0; i < n; i++) evs[i] = evq[(evT + i) & 63];
+                        evT = evH;
                     }
+                    if (e != null) e.control(tn, evs);
+                    for (Engine tk : tks) tk.control(tn, evs);
                     tick += UPDATE_S;
                 }
                 tick -= (double) CHUNK / RATE;
@@ -444,9 +582,27 @@ public final class TTSSms {
                     continue;
                 }
                 if (track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING) track.play();
-                track.write(out, 0, out.length);
+                int wr = track.write(out, 0, out.length);
+                if (wr < 0 || track.getState() != AudioTrack.STATE_INITIALIZED) {
+                    // r158: the Android audio output went away (screen recorder, a call, Bluetooth / route
+                    // change, audio server restart): a dead track takes the samples silently forever - make a new one
+                    TTSHornPad.log("sms audio: track lost (" + wr + "), new one");
+                    try {
+                        track.release();
+                    } catch (Throwable t2) {
+                        // gone
+                    }
+                    track = null;
+                    Thread.sleep(50);
+                }
             } catch (Throwable t) {
                 TTSHornPad.log("sms audio: " + t);
+                try {
+                    if (track != null) track.release();
+                } catch (Throwable t2) {
+                    // gone
+                }
+                track = null;
                 try {
                     Thread.sleep(200);
                 } catch (InterruptedException ie) {
@@ -460,7 +616,7 @@ public final class TTSSms {
         try {
             int min = AudioTrack.getMinBufferSize(RATE, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT);
             return new AudioTrack(AudioManager.STREAM_MUSIC, RATE, AudioFormat.CHANNEL_OUT_STEREO,
-                    AudioFormat.ENCODING_PCM_16BIT, Math.max(min, CHUNK * 4 * 4), AudioTrack.MODE_STREAM);
+                    AudioFormat.ENCODING_PCM_16BIT, Math.max(min, RATE * 4 * 150 / 1000), AudioTrack.MODE_STREAM);   // r158: 150 ms (was 40): no underrun crackle / gaps when the game is busy
         } catch (Throwable t) {
             TTSHornPad.log("sms track: " + t);
             return null;
@@ -472,7 +628,7 @@ public final class TTSSms {
      * between two values that already keep THAT block under the ceiling (-1 dBFS), and recovers slowly.
      */
     static final class Limiter {
-        static final float CEIL = 0.89f;
+        static final float CEIL = 0.5f;        // r158: -6 dBFS (was -1): this track + the horn pad + the game are summed by Android
         final float[] prev = new float[CHUNK];
         float needPrev = 1f, g = 1f;
         boolean have;
@@ -544,6 +700,11 @@ public final class TTSSms {
         }
 
         static Engine open(File dir) throws Exception {
+            return open(dir, -1);
+        }
+
+        /** r158: acMode -1 = the .sms as listed; 0 = only the non-AC ones; 1 = only the AC ones of the folder ("ac" in the name) */
+        static Engine open(File dir, int acMode) throws Exception {
             File[] fs = dir.listFiles();
             if (fs == null) return null;
             Engine e = new Engine(dir);
@@ -572,10 +733,17 @@ public final class TTSSms {
                     }
                 }
             }
-            if (want.isEmpty()) {
+            if (want.isEmpty() || acMode == 1) {
+                if (acMode == 1) want.clear();
                 ArrayList<String> all = new ArrayList<String>(e.byName.keySet());
                 java.util.Collections.sort(all);
                 for (String n : all) if (n.endsWith(".sms")) want.add(n);
+            }
+            if (acMode >= 0) {
+                ArrayList<String> keep = new ArrayList<String>();
+                for (String n : want) if (isAC(n.replace(".sms", "")) == (acMode == 1)) keep.add(n);
+                want = keep;
+                e.acRole = acMode;
             }
             for (String n : want) {
                 File f = e.byName.get(n);
@@ -596,6 +764,12 @@ public final class TTSSms {
         Wav wav(String name) {
             String k = name.toLowerCase(Locale.US);
             if (wavs.containsKey(k)) return wavs.get(k);
+            Wav w0 = wavFind(k);
+            if (w0 == null) TTSHornPad.log("sms: " + dir.getName() + " wav missing: " + name);   // r158
+            return w0;
+        }
+
+        Wav wavFind(String k) {
             Wav w = null;
             File f = byName.get(k);
             if (f == null) {
@@ -603,7 +777,7 @@ public final class TTSSms {
                 int sl = Math.max(k.lastIndexOf('\\'), k.lastIndexOf('/'));
                 if (sl >= 0) f = byName.get(k.substring(sl + 1));
             }
-            if (f != null) w = Wav.open(f);
+            if (f != null) w = Wav.shared(f);
             wavs.put(k, w);
             return w;
         }
@@ -656,9 +830,49 @@ public final class TTSSms {
             // camera
             float d = TTSHornPad.camD;
             int ci = TTSHornPad.camIn;
-            // r155: a track sound = the bogeys next to the camera: distance to the nearest vehicle, not to the loco
-            if (isTrack && ci != 1 && TTSHornPad.camN >= 0f) d = TTSHornPad.camN;
+            // r158: the pass of a standing camera, followed smoothly between the 5-per-second HUD lines:
+            // s = along-track offset of the loco (minus = still coming), b = passing distance, u = speed
+            float ps = 0f, pb = 0f, pu = 0f;
+            boolean pass = false;
+            if (ci == 0 && TTSHornPad.passU >= 6f) {
+                double age = (now - TTSHornPad.passT) / 1e9;
+                if (age >= 0 && age < 1.5) {
+                    pu = TTSHornPad.passU;
+                    pb = Math.max(2f, TTSHornPad.passB);
+                    ps = TTSHornPad.passS + pu * (float) age;
+                    pass = true;
+                }
+            }
+            float vr = 0f;                                    // range rate, minus = coming closer
+            if (isTrack) {
+                // r155/r158: a track sound = the bogeys next to the camera: the nearest vehicle.  While the train
+                // runs past the camera that is a coach right beside it: distance = the passing distance, no
+                // Doppler (it moves across, not towards); before the loco / after the last coach: like a source there
+                float n = TTSHornPad.camN;
+                if (ci != 1 && n >= 0f) {
+                    if (pass) {
+                        float side = (float) Math.sqrt(pb * pb + 144f);
+                        if (ps < 0f) {
+                            d = (float) Math.sqrt(ps * ps + pb * pb);
+                            vr = pu * ps / d;
+                        } else if (n <= side) {
+                            d = pb;
+                        } else {
+                            d = n;
+                            float sn = (float) Math.sqrt(Math.max(0f, n * n - pb * pb));
+                            vr = pu * sn / Math.max(1f, n);
+                        }
+                    } else d = n;
+                }
+            } else if (pass) {
+                d = (float) Math.sqrt(ps * ps + pb * pb);
+                vr = pu * ps / d;
+            }
             if (d < 0f) d = 5f;
+            // smooth distance: a nearest-coach change or a 5-per-second step must not jump the volume
+            if (dSm < 0f || Math.abs(d - dSm) > 150f) dSm = d;
+            else dSm += (d - dSm) * (float) Math.min(1.0, UPDATE_S / 0.25);
+            d = dSm;
             vars.dist = d;
             vars.cam = ci;      // 0 outside, 1 cab, 2 passenger seat
             // r154: a track sound .sms made only for the outside view (Activation ExternalCam): in the cab / a coach
@@ -681,12 +895,14 @@ public final class TTSSms {
                     mFc = ci == 1 ? 3500f : 5000f;
                 }
             }
-            // Doppler of the moving loco (OpenAL DOPPLER_FACTOR 1): range rate from the HUD, glides
-            float vr = ci == 0 ? TTSHornPad.camV : 0f;
+            // r158: Doppler of a moving source and a standing listener, f' = f c / (c + vr) (vr = range rate,
+            // minus = coming closer), only for a standing camera (r157); glides 0.12 s
             if (vr > 90f) vr = 90f;
             if (vr < -90f) vr = -90f;
-            float target = 1f - vr / 343f;
-            dopp += (target - dopp) * (float) Math.min(1.0, dt / 0.08);
+            float target = 343f / (343f + vr);
+            dopp += (target - dopp) * (float) Math.min(1.0, dt / 0.12);
+            // r158: AC / non-AC sound set of a track sound asset: the one of the coach next to the camera plays
+            if (acRole >= 0) roleTo = ((acRole == 1) == nearAC) ? 1f : 0f;
             for (int ev : evs)
                 for (Source s : sources) s.handleEvent(ev);
             for (Source s : sources) s.update(this);
@@ -698,6 +914,9 @@ public final class TTSSms {
         boolean isTrack;            // r154: a track sound (bogeys), not the loco
         float muffleTo, muffle, lp; // r154: 0 = open, 1 = heard through the cab / coach body
         float mGainTo = 0.5f, mGain = 0.5f, mFc = 1400f;   // r156: gain / low-pass of that body (cab, coach, AC coach)
+        float dSm = -1f;            // r158: smoothed distance
+        int acRole = -1;            // r158: -1 one sound set, 0 = the non-AC set, 1 = the AC set of a track asset
+        float roleTo = 1f, roleG = 1f;
 
         void render(float[] acc, int n) {
             Arrays.fill(acc, 0f);
@@ -705,6 +924,14 @@ public final class TTSSms {
             for (Source s : sources)
                 for (Stream st : s.streams)
                     if (st.al != null) st.al.render(acc, n, mv, dopp);
+            if (acRole >= 0 && !(roleG == 1f && roleTo == 1f)) {     // r158: AC / non-AC cross-fade 0.4 s
+                float rk = 1f / (0.4f * RATE);
+                for (int i = 0; i < n; i++) {
+                    if (roleG < roleTo) roleG = Math.min(roleTo, roleG + rk);
+                    else if (roleG > roleTo) roleG = Math.max(roleTo, roleG - rk);
+                    acc[i] *= roleG;
+                }
+            }
             if (muffle == 0f && muffleTo == 0f) {
                 lp = 0f;
                 return;
@@ -1581,6 +1808,109 @@ public final class TTSSms {
         int dataOff, frames, rate, bits, ch;
         int[] cues;         // sample frames, sorted (Open Rails: chunk + block + sample offset)
         boolean origMono;
+        float[] fl;         // r158: a clipped recording, repaired (de-clipped, -3 dB) - read from here instead
+        String name = "";
+
+        // r158: one mapping per file for every sound set (the AC / non-AC sets and both .sms of an asset share
+        // them) and no forced load of the whole file: r157 kept every wav of the sets resident, 700 MB+ with a
+        // big track sound pack, which crowded the game's own models / textures out of memory
+        static final HashMap<String, Wav> SHARED = new HashMap<String, Wav>();
+
+        static Wav shared(File f) {
+            String k = f.getAbsolutePath() + "|" + f.length() + "|" + f.lastModified();   // a replaced file is read again
+            synchronized (SHARED) {
+                if (SHARED.containsKey(k)) return SHARED.get(k);
+            }
+            Wav w = open(f);
+            if (w != null) w.name = f.getName();
+            synchronized (SHARED) {
+                SHARED.put(k, w);
+            }
+            if (w != null) prefetch(w);
+            return w;
+        }
+
+        static final java.util.concurrent.LinkedBlockingQueue<Wav> PF = new java.util.concurrent.LinkedBlockingQueue<Wav>();
+        static Thread pfThread;
+
+        /** touches the first second of a file off the audio thread, so its first play does not wait for the disk */
+        static synchronized void prefetch(Wav w) {
+            PF.offer(w);
+            if (pfThread != null) return;
+            pfThread = new Thread(new Runnable() {
+                public void run() {
+                    android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                    while (true) {
+                        try {
+                            Wav x = PF.take();
+                            if (x.fl != null) continue;
+                            int bytes = Math.min(x.frames, x.rate) * x.ch * (x.bits / 8);
+                            int sum = 0;
+                            for (int i = 0; i < bytes; i += 4096) sum += x.bb.get(x.dataOff + i);
+                            if (sum == 42) Thread.yield();
+                        } catch (Throwable t) {
+                            // next
+                        }
+                    }
+                }
+            }, "TTSSmsPrefetch");
+            pfThread.setDaemon(true);
+            pfThread.start();
+        }
+
+        /**
+         * r158: a recording with flat-topped (clipped) peaks crackles ("fete jay") on a phone speaker whatever the
+         * volume.  Runs of 2+ samples stuck at full scale are rebuilt with a cubic through the neighbours, the
+         * whole file goes 3 dB down to make room for the rebuilt peaks.
+         */
+        void declipIfNeeded(String name) {
+            if (bits != 16 || frames < 64 || frames > 3000000) return;
+            int clipped = 0;
+            for (int i = 0; i < frames; i++) {
+                float v = raw(i);
+                if (v >= 0.995f || v <= -0.995f) clipped++;
+            }
+            if (clipped < 32) return;
+            float[] x = new float[frames];
+            for (int i = 0; i < frames; i++) x[i] = raw(i);
+            int runs = 0;
+            int i = 1;
+            while (i < frames - 2) {
+                if (Math.abs(x[i]) >= 0.995f) {
+                    int a = i, b = i;
+                    float sg = Math.signum(x[i]);
+                    while (b + 1 < frames - 2 && Math.abs(x[b + 1]) >= 0.995f && Math.signum(x[b + 1]) == sg) b++;
+                    if (b > a && a >= 2) {
+                        int L = b - a + 2;                       // from a-1 to b+1
+                        float p0 = x[a - 1], p1 = x[b + 1];
+                        float m0 = (x[a - 1] - x[a - 2]) * L, m1 = (x[b + 2] - x[b + 1]) * L;
+                        for (int k = a; k <= b; k++) {
+                            float t = (float) (k - (a - 1)) / L;
+                            float t2 = t * t, t3 = t2 * t;
+                            float y = (2 * t3 - 3 * t2 + 1) * p0 + (t3 - 2 * t2 + t) * m0 + (-2 * t3 + 3 * t2) * p1 + (t3 - t2) * m1;
+                            if (sg > 0 && y < x[k]) y = x[k];
+                            if (sg < 0 && y > x[k]) y = x[k];
+                            if (y > 1.6f) y = 1.6f;
+                            if (y < -1.6f) y = -1.6f;
+                            x[k] = y;
+                        }
+                        runs++;
+                    }
+                    i = b + 1;
+                } else i++;
+            }
+            float peak = 0f;
+            for (float v : x) peak = Math.max(peak, Math.abs(v));
+            float g = Math.min(0.708f, 0.98f / Math.max(peak, 1e-6f));
+            for (int k = 0; k < frames; k++) x[k] *= g;
+            fl = x;
+            TTSHornPad.log("sms: " + name + " was clipped (" + clipped + " samples, " + runs + " runs): repaired, x" + String.format(Locale.US, "%.2f", g));
+        }
+
+        float raw(int f) {
+            int q = dataOff + f * 2 * ch + (ch == 2 ? 2 : 0);
+            return bb.getShort(q) * (1f / 32768f);
+        }
 
         static Wav open(File f) {
             RandomAccessFile raf = null;
@@ -1651,11 +1981,7 @@ public final class TTSSms {
                     if (w.ch == 2) for (int i = 0; i < c.length; i++) c[i] = (c[i] / 2) * 2;   // ConvertToMono halves, OpenWavFile doubles
                     w.cues = c;
                 }
-                try {
-                    m.load();                       // into the page cache now, not on the audio thread
-                } catch (Throwable t) {
-                    // fine
-                }
+                w.declipIfNeeded(f.getName());
                 return w;
             } catch (Throwable t) {
                 TTSHornPad.log("sms wav " + f.getName() + ": " + t);
@@ -1671,6 +1997,7 @@ public final class TTSSms {
 
         float at(int f) {
             if (f < 0 || f >= frames) return 0f;
+            if (fl != null) return fl[f];
             if (bits == 16) {
                 int q = dataOff + f * 2 * ch + (ch == 2 ? 2 : 0);
                 return bb.getShort(q) * (1f / 32768f);
@@ -1955,6 +2282,38 @@ public final class TTSSms {
 
         /** mix this source into acc (mono) for n frames; gTarget = final gain incl. distance, clamped */
         void mix(float[] acc, int n, float gTarget, float step0) {
+            if (gNow == 0f && gTarget == 0f && dc == 0f && step0 > 0f) {
+                // r158: inaudible (volume 0 - most speed-band streams most of the time): keep the play position
+                // moving exactly as before, without reading or interpolating a single sample (CPU, memory)
+                if (state == AL_PLAYING && !q.isEmpty() && cur < q.size()) {
+                    double rem = n;
+                    int guard = 0;
+                    while (rem > 1e-9 && state == AL_PLAYING && ++guard < 256) {
+                        ABuf b = q.get(cur);
+                        double step = step0 * (double) b.w.rate / RATE;
+                        double left = (b.n - pos) / step;
+                        if (left > rem) {
+                            pos += rem * step;
+                            rem = 0;
+                        } else {
+                            rem -= Math.max(0.0, left);
+                            pos = 0;
+                            cur++;
+                            if (cur >= q.size()) {
+                                if (looping) cur = 0;
+                                else {
+                                    state = AL_STOPPED;
+                                    cur = q.size();
+                                }
+                            }
+                        }
+                    }
+                    h1 = 0f;
+                    seam = true;
+                }
+                lastOut = 0f;
+                return;
+            }
             float g = gNow;
             float dg = (gTarget - g) / n;
             for (int i = 0; i < n; i++) {
