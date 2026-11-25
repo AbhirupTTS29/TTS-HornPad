@@ -502,7 +502,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             TTSSms.setPaused(false);
             hud.resume();
             boost.start();
-            watchRecording(a);
+            // r166: watchRecording(a) removed - the r165 recorder-hide is reverted (no sound after the recorder's stop tap)
         } catch (Throwable t) {
             log("attach: " + t);
         }
@@ -586,6 +586,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         long loadFailAt;
         volatile State last;                         // the latest state (a new pad starts from it)
         File base;                                   // .../files (UserData lives under it)
+        File mstsRoot;                               // r166: MSTS vehicles made by libttsshrink (files/tts_msts/hash-XX)
         final HashMap<String, File> kuidDirs = new HashMap<String, File>();
         long lastScan = 0;
 
@@ -594,6 +595,13 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 File f = a.getExternalFilesDir(null);
                 if (f == null) f = new File("/sdcard/Android/data/com.n3vgames.android.trainz/files");
                 base = f;
+            }
+            if (mstsRoot == null) {
+                try {
+                    mstsRoot = new File(a.getFilesDir(), "tts_msts");
+                } catch (Throwable t) {
+                    // none
+                }
             }
             if (th != null && th.isAlive()) return;
             run = true;
@@ -867,8 +875,11 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         void scan() {
             HashMap<String, File> m = new HashMap<String, File>();
             String[] roots = {"UserData/original", "UserData/local"};
-            for (String r : roots) {
-                File[] hashes = new File(base, r).listFiles();
+            for (int ri = 0; ri <= roots.length; ri++) {
+                // r166: the last root is the MSTS twin folders (their .sms enginesound assets live there)
+                File rootDir = ri < roots.length ? new File(base, roots[ri]) : mstsRoot;
+                if (rootDir == null) continue;
+                File[] hashes = rootDir.listFiles();
                 if (hashes == null) continue;
                 for (File h : hashes) {
                     File[] assets = h.listFiles();
@@ -2391,6 +2402,11 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         volatile int[][] obj = new int[0][];  // k, side, dist, val, lim, aspect level, route
         volatile int[] prof;                  // here + 20 columns (dm), Integer.MIN_VALUE = no data
         volatile String[] lights;             // TTSHL fields
+        volatile String[] msts;               // r166: TTSMS fields (MSTS vehicles of the driven train)
+        int cpPage;                           // r166: CONTROL PANEL page, 0 LIGHTS / 1 LOCO
+        long msUntil[] = new long[6], hmUntil;
+        boolean msWant[] = new boolean[6];
+        int hmWant;
         volatile long objTime;                // when the objects came (distances run on with the speed)
         volatile int objTrav;
         // ---- kept here (instant)
@@ -2506,7 +2522,45 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                     changed = true;
                 }
             }
+            l = lineAfter(s, "TTSMS: ");
+            if (l != null && s.lastIndexOf("TTSMS: ") > done) {
+                String[] f = split(l, '^');
+                if (f.length >= 10) {
+                    msts = f;
+                    int a = num(f[7], 0);
+                    for (int i = 0; i < 6; i++)
+                        if (msUntil[i] != 0 && ((a >> i & 1) != 0) == msWant[i]) msUntil[i] = 0;
+                    if (hmUntil != 0 && num(f[8], 0) == hmWant) hmUntil = 0;
+                    changed = true;
+                }
+            }
             if (changed) refresh();
+        }
+
+        /** r166: MSTS switch i (0 panto front, 1 panto back, 2 doors left, 3 doors right, 4 wiper, 5 mirror) */
+        boolean ms(int i) {
+            String[] f = msts;
+            boolean gs = f != null && f.length > 7 && (num(f[7], 0) >> i & 1) != 0;
+            if (msUntil[i] != 0 && System.currentTimeMillis() < msUntil[i]) return msWant[i];
+            msUntil[i] = 0;
+            return gs;
+        }
+
+        /** r166: MSTS count field (1 panto, 2 doors left, 3 doors right, 4 wiper, 5 mirror, 6 vehicles with lights) */
+        int msN(int i) {
+            String[] f = msts;
+            return f != null && f.length > i ? num(f[i], 0) : 0;
+        }
+
+        /** r166: headlight 0 off / 1 dim / 2 bright */
+        int headMode() {
+            String[] f = msts;
+            int gs;
+            if (f != null && f.length > 8) gs = num(f[8], 0);
+            else gs = light(0) ? (light(1) ? 2 : 1) : 0;
+            if (hmUntil != 0 && System.currentTimeMillis() < hmUntil) return hmWant;
+            hmUntil = 0;
+            return gs;
         }
 
         void refresh() {
@@ -2611,6 +2665,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 compact = sp.getBoolean("compact", false);
                 lightsOn = sp.getBoolean("lightsOn", true);
                 hideAll = sp.getBoolean("hideAll", false);
+                cpPage = sp.getInt("cpPage", 0) == 1 ? 1 : 0;
             } catch (Throwable e) {
                 log("hud prefs: " + e);
             }
@@ -2619,7 +2674,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         void savePrefs(Context c) {
             try {
                 c.getSharedPreferences("tts_hud", Context.MODE_PRIVATE).edit().putBoolean("monOn", monOn)
-                        .putBoolean("compact", compact).putBoolean("lightsOn", lightsOn).putBoolean("hideAll", hideAll).apply();
+                        .putBoolean("compact", compact).putBoolean("lightsOn", lightsOn).putBoolean("hideAll", hideAll).putInt("cpPage", cpPage).apply();
             } catch (Throwable e) {
                 log("hud prefs: " + e);
             }
@@ -2830,6 +2885,35 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                     break;
                 case 21:
                     Hud.send(21);
+                    break;
+                case 50:      // r166: CONTROL PANEL tabs
+                case 51:
+                    h.cpPage = a - 50;
+                    break;
+                case 30:      // r166: MSTS parts (pantographs, doors, wiper, mirror)
+                case 31:
+                case 32:
+                case 33:
+                case 34:
+                case 35: {
+                    int i = a - 30;
+                    h.msWant[i] = !h.ms(i);
+                    h.msUntil[i] = now + 2500;
+                    Hud.send(a);
+                    break;
+                }
+                case 36:      // r166: headlight off / dim / bright
+                case 37:
+                case 38:
+                    h.hmWant = a - 36;
+                    h.hmUntil = now + 2500;
+                    h.lightWant[0] = a != 36;
+                    h.lightUntil[0] = now + 2500;
+                    if (a != 36) {
+                        h.lightWant[1] = a == 38;
+                        h.lightUntil[1] = now + 2500;
+                    }
+                    Hud.send(a);
                     break;
                 case 18:      // r162: front marker colour white <-> red
                 case 19: {    //       back marker colour
@@ -3273,9 +3357,93 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             hit(cx - 6 * sc, y, cx + cw + 6 * sc, y + rh, cmd);
         }
 
+        /** r166: rows of the LOCO page (what the MSTS vehicles of the train have) */
+        float locoH(Hud h, float step, float sec, float rowH) {
+            int rows = 1, secs = 1;                       // headlight off / dim / bright
+            int np = h.msN(1);
+            if (np > 0) { secs++; rows += np >= 2 ? 2 : 1; }
+            int dl = h.msN(2), dr = h.msN(3);
+            if (dl + dr > 0) { secs++; rows += (dl > 0 ? 1 : 0) + (dr > 0 ? 1 : 0); }
+            int cab = (h.msN(4) > 0 ? 1 : 0) + (h.msN(5) > 0 ? 1 : 0);
+            if (cab > 0) { secs++; rows += cab; }
+            secs++; rows += 2;                            // markers both ends, emergency flasher
+            return rows * step + secs * sec + 1.3f * rowH + 4 * sc;
+        }
+
+        /** r166: OFF / DIM / BRIGHT chooser (commands 36 / 37 / 38) */
+        void segRow(Canvas c, int sel, float L, float y, float panelW, float rh, float fsSmall) {
+            String[] nm = {"OFF", "DIM", "BRIGHT"};
+            float w = (panelW - 12 * sc) / 3f;
+            for (int i = 0; i < 3; i++) {
+                float x = L + 6 * sc + i * w;
+                boolean on = sel == i;
+                box(c, x + 1 * sc, y, w - 2 * sc, rh, on ? (i == 0 ? 0xF03A2A1A : 0xF0143C28) : 0xF0162440);
+                if (on) box(c, x + 1 * sc, y, w - 2 * sc, 3 * sc, i == 0 ? 0xFFB0B8C8 : 0xFF38E07B);
+                textC(c, nm[i], x, y, w, rh, fsSmall, on ? 0xFFFFFFFF : 0xFF8A97AD, true);
+                hit(x, y, x + w, y + rh, 36 + i);
+            }
+        }
+
+        void drawLoco(Canvas c, Hud h, float L, float y, float panelW, float rh, float step, float sec, float fs, float fsSmall) {
+            section(c, "HEADLIGHT", L, y, panelW, fsSmall);
+            y += sec;
+            segRow(c, h.headMode(), L, y, panelW, rh, fsSmall);
+            y += step;
+            int np = h.msN(1);
+            if (np > 0) {
+                section(c, "PANTOGRAPH", L, y, panelW, fsSmall);
+                y += sec;
+                if (np >= 2) {
+                    toggleRow(c, "Front pantograph", h.ms(0), 30, L, y, panelW, rh, fs, 0);
+                    y += step;
+                    toggleRow(c, "Back pantograph", h.ms(1), 31, L, y, panelW, rh, fs, 0);
+                    y += step;
+                } else {
+                    toggleRow(c, "Pantograph", h.ms(0), 30, L, y, panelW, rh, fs, 0);
+                    y += step;
+                }
+            }
+            int dl = h.msN(2), dr = h.msN(3);
+            if (dl + dr > 0) {
+                section(c, "DOORS", L, y, panelW, fsSmall);
+                y += sec;
+                if (dl > 0) {
+                    toggleRow(c, "Doors left", h.ms(2), 32, L, y, panelW, rh, fs, 0);
+                    y += step;
+                }
+                if (dr > 0) {
+                    toggleRow(c, "Doors right", h.ms(3), 33, L, y, panelW, rh, fs, 0);
+                    y += step;
+                }
+            }
+            if (h.msN(4) + h.msN(5) > 0) {
+                section(c, "CAB", L, y, panelW, fsSmall);
+                y += sec;
+                if (h.msN(4) > 0) {
+                    toggleRow(c, "Wipers", h.ms(4), 34, L, y, panelW, rh, fs, 0);
+                    y += step;
+                }
+                if (h.msN(5) > 0) {
+                    toggleRow(c, "Mirrors out", h.ms(5), 35, L, y, panelW, rh, fs, 0);
+                    y += step;
+                }
+            }
+            section(c, "MARKERS / FLASHER", L, y, panelW, fsSmall);
+            y += sec;
+            toggleRow(c, "Marker lights", h.light(2) && h.light(3), 11, L, y, panelW, rh, fs, 0);
+            y += step;
+            toggleRow(c, "Emergency flasher", h.light(6), 16, L, y, panelW, rh, fs, 0);
+            y += step + 2 * sc;
+            String[] mf = h.msts;
+            String info = mf != null && mf.length > 9 ? mf[9] : "No MSTS vehicle in this train";
+            text(c, info, L + 8 * sc, y, fsSmall, 0xFF93A7C2, false, panelW - 16 * sc);
+        }
+
         void drawLights(Canvas c, Hud h, int side, float ppi, float fs, float fsSmall, float rowH, float W, float Hh) {
             float step = rowH + 14 * sc, panelW = 1.12f * ppi, rh = step - 4 * sc, sec = fsSmall * 1.9f;
-            float bodyH = 8 * step + 3 * sec + 1.3f * rowH + 4 * sc;
+            float tabH = rh * 0.85f + 8 * sc;
+            float bodyH = h.cpPage == 1 ? locoH(h, step, sec, rowH) : 8 * step + 3 * sec + 1.3f * rowH + 4 * sc;
+            bodyH += tabH;
             float panelH = h.lightsOn ? rowH + 8 * sc + bodyH : rowH + 8 * sc;
             float top = Hh * 0.22f;
             if (top + panelH > Hh - 0.45f * ppi) top = Hh - 0.45f * ppi - panelH;
@@ -3300,6 +3468,21 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             hit(L, top, L + panelW, top + rowH + 6 * sc, 6);
             if (!h.lightsOn) return;
             float y = top + rowH + 12 * sc;
+            // r166: page tabs LIGHTS | LOCO
+            float tw = (panelW - 12 * sc) / 2f, th = rh * 0.85f;
+            for (int t = 0; t < 2; t++) {
+                boolean sel = h.cpPage == t;
+                float tx = L + 6 * sc + t * tw;
+                box(c, tx + 1 * sc, y, tw - 2 * sc, th, sel ? 0xF024406E : 0xF0101C30);
+                if (sel) box(c, tx + 1 * sc, y + th - 3 * sc, tw - 2 * sc, 3 * sc, 0xFFFF8A1E);
+                textC(c, t == 0 ? "LIGHTS" : "LOCO", tx, y, tw, th, fsSmall, sel ? 0xFFFFB733 : 0xFF8A97AD, true);
+                hit(tx, y, tx + tw, y + th, 50 + t);
+            }
+            y += th + 8 * sc;
+            if (h.cpPage == 1) {
+                drawLoco(c, h, L, y, panelW, rh, step, sec, fs, fsSmall);
+                return;
+            }
             section(c, "HEADLIGHT", L, y, panelW, fsSmall);
             y += sec;
             toggleRow(c, "Headlights", h.light(0), 10, L, y, panelW, rh, fs, 0);
