@@ -105,32 +105,20 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
 
         static void start(Context c) {
             if (c == null) return;
-            Thread t = new Thread(new Markers(c), "TTSMarkers");
-            t.setDaemon(true);
-            t.setPriority(Thread.MIN_PRIORITY);
-            t.start();
+            // r163: only phones that ran r162 (its index file is there) - done here, before the game's own
+            // loader starts, so the database is put right in this same start
+            if (!new File(c.getFilesDir(), "tts_markers.idx").isFile()) return;
+            new Markers(c).run();
         }
 
+        // r163: the r162 config change made many addon locos FAULTY after the database update (his log:
+        // "has faulty dependencies due to <kuid:761728:100546>" and more).  Undone: every config.txt that has a
+        // config.txt.ttsorig gets its original back (the size change makes the loader update the database
+        // again at the next start).  Nothing is added to any loco any more.
         public void run() {
             try {
-                Thread.sleep(4000);                      // let the game start first
                 File files = new File("/sdcard/Android/data/" + c.getPackageName() + "/files/UserData");
-                File idxF = new File(c.getFilesDir(), "tts_markers.idx");
-                HashMap<String, String> idx = new HashMap<String, String>();
-                if (idxF.isFile()) {
-                    java.io.BufferedReader r = new java.io.BufferedReader(new java.io.InputStreamReader(new FileInputStream(idxF), "UTF-8"));
-                    try {
-                        String l;
-                        while ((l = r.readLine()) != null) {
-                            int k = l.lastIndexOf('|');
-                            if (k > 0) idx.put(l.substring(0, k), l.substring(k + 1));
-                        }
-                    } finally {
-                        r.close();
-                    }
-                }
-                int added = 0, locos = 0;
-                boolean dirty = false;
+                int restored = 0;
                 for (String root : new String[]{"original", "local"}) {
                     File[] hashes = new File(files, root).listFiles();
                     if (hashes == null) continue;
@@ -138,38 +126,30 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                         File[] assets = h.listFiles();
                         if (assets == null) continue;
                         for (File a : assets) {
-                            File cfg = new File(a, "config.txt");
-                            if (!cfg.isFile()) continue;
-                            String key = cfg.getAbsolutePath();
-                            String stamp = VER + ":" + cfg.length() + ":" + cfg.lastModified();
-                            if (stamp.equals(idx.get(key))) continue;
-                            int n = 0;
+                            File bak = new File(a, "config.txt.ttsorig");
+                            if (!bak.isFile()) continue;
                             try {
-                                n = patch(a, cfg);
+                                File cfg = new File(a, "config.txt");
+                                File tmp = new File(a, "config.txt.ttsnew");
+                                byte[] d = readAll(bak);
+                                FileOutputStream o = new FileOutputStream(tmp);
+                                try {
+                                    o.write(d);
+                                } finally {
+                                    o.close();
+                                }
+                                if (tmp.renameTo(cfg)) {
+                                    bak.delete();
+                                    restored++;
+                                } else tmp.delete();
                             } catch (Throwable e) {
-                                log("markers: " + a.getName() + ": " + e);
+                                log("markers: restore " + a.getName() + ": " + e);
                             }
-                            if (n > 0) {
-                                added += n;
-                                locos++;
-                                log("markers: " + n + " lamps at the ditch points of " + a.getName());
-                            }
-                            idx.put(key, VER + ":" + cfg.length() + ":" + cfg.lastModified());
-                            dirty = true;
                         }
                     }
                 }
-                if (dirty) {
-                    StringBuilder b = new StringBuilder();
-                    for (java.util.Map.Entry<String, String> e : idx.entrySet()) b.append(e.getKey()).append('|').append(e.getValue()).append('\n');
-                    FileOutputStream o = new FileOutputStream(idxF);
-                    try {
-                        o.write(b.toString().getBytes("UTF-8"));
-                    } finally {
-                        o.close();
-                    }
-                }
-                if (locos > 0) log("markers: " + locos + " locos got " + added + " marker lamps (active after the next start)");
+                new File(c.getFilesDir(), "tts_markers.idx").delete();
+                if (restored > 0) log("markers: " + restored + " loco configs restored to the original (database update at the next start)");
             } catch (Throwable t) {
                 log("markers: " + t);
             }
