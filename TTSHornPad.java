@@ -81,7 +81,324 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             log("onCreate: " + t);
         }
         installAddons(app);
+        Markers.start(app);
         return true;
+    }
+
+    // ================================================================ r162: marker lamps at the ditch-light points
+    /**
+     * Every locomotive in UserData (addons) whose mesh has ditch-light attachment points (a.ditch0 .. a.ditch3)
+     * gets TTS marker lamps there - corona effects tts_marker_front_d0 / _d1 (a.ditch0 / 1) and
+     * tts_marker_back_d2 / _d3 (a.ditch2 / 3), invisible until the CONTROL PANEL switches them on in white or
+     * red.  Nothing has to be written in the loco by its maker.  The config.txt is changed once (a copy is
+     * kept as config.txt.ttsorig); its new size makes the loader ask the game for a database update at the
+     * next start.  Runs in the background; checked folders are remembered (tts_markers.idx).
+     */
+    static final class Markers implements Runnable {
+        static final String TAG = "tts_marker_";
+        static final String VER = "m1";
+        final Context c;
+
+        Markers(Context c) {
+            this.c = c;
+        }
+
+        static void start(Context c) {
+            if (c == null) return;
+            Thread t = new Thread(new Markers(c), "TTSMarkers");
+            t.setDaemon(true);
+            t.setPriority(Thread.MIN_PRIORITY);
+            t.start();
+        }
+
+        public void run() {
+            try {
+                Thread.sleep(4000);                      // let the game start first
+                File files = new File("/sdcard/Android/data/" + c.getPackageName() + "/files/UserData");
+                File idxF = new File(c.getFilesDir(), "tts_markers.idx");
+                HashMap<String, String> idx = new HashMap<String, String>();
+                if (idxF.isFile()) {
+                    java.io.BufferedReader r = new java.io.BufferedReader(new java.io.InputStreamReader(new FileInputStream(idxF), "UTF-8"));
+                    try {
+                        String l;
+                        while ((l = r.readLine()) != null) {
+                            int k = l.lastIndexOf('|');
+                            if (k > 0) idx.put(l.substring(0, k), l.substring(k + 1));
+                        }
+                    } finally {
+                        r.close();
+                    }
+                }
+                int added = 0, locos = 0;
+                boolean dirty = false;
+                for (String root : new String[]{"original", "local"}) {
+                    File[] hashes = new File(files, root).listFiles();
+                    if (hashes == null) continue;
+                    for (File h : hashes) {
+                        File[] assets = h.listFiles();
+                        if (assets == null) continue;
+                        for (File a : assets) {
+                            File cfg = new File(a, "config.txt");
+                            if (!cfg.isFile()) continue;
+                            String key = cfg.getAbsolutePath();
+                            String stamp = VER + ":" + cfg.length() + ":" + cfg.lastModified();
+                            if (stamp.equals(idx.get(key))) continue;
+                            int n = 0;
+                            try {
+                                n = patch(a, cfg);
+                            } catch (Throwable e) {
+                                log("markers: " + a.getName() + ": " + e);
+                            }
+                            if (n > 0) {
+                                added += n;
+                                locos++;
+                                log("markers: " + n + " lamps at the ditch points of " + a.getName());
+                            }
+                            idx.put(key, VER + ":" + cfg.length() + ":" + cfg.lastModified());
+                            dirty = true;
+                        }
+                    }
+                }
+                if (dirty) {
+                    StringBuilder b = new StringBuilder();
+                    for (java.util.Map.Entry<String, String> e : idx.entrySet()) b.append(e.getKey()).append('|').append(e.getValue()).append('\n');
+                    FileOutputStream o = new FileOutputStream(idxF);
+                    try {
+                        o.write(b.toString().getBytes("UTF-8"));
+                    } finally {
+                        o.close();
+                    }
+                }
+                if (locos > 0) log("markers: " + locos + " locos got " + added + " marker lamps (active after the next start)");
+            } catch (Throwable t) {
+                log("markers: " + t);
+            }
+        }
+
+        /** tokens of a Trainz config: words / quoted strings / { / } with their start and end offsets */
+        static java.util.ArrayList<int[]> tokens(String s) {
+            java.util.ArrayList<int[]> t = new java.util.ArrayList<int[]>();
+            int i = 0, n = s.length();
+            while (i < n) {
+                char ch = s.charAt(i);
+                if (ch <= ' ') {
+                    i++;
+                } else if (ch == '{' || ch == '}') {
+                    t.add(new int[]{i, i + 1});
+                    i++;
+                } else if (ch == '"') {
+                    int j = s.indexOf('"', i + 1);
+                    if (j < 0) j = n - 1;
+                    t.add(new int[]{i, j + 1});
+                    i = j + 1;
+                } else {
+                    int j = i;
+                    while (j < n && s.charAt(j) > ' ' && s.charAt(j) != '{' && s.charAt(j) != '}' && s.charAt(j) != '"') j++;
+                    t.add(new int[]{i, j});
+                    i = j;
+                }
+            }
+            return t;
+        }
+
+        static String tok(String s, int[] k) {
+            String v = s.substring(k[0], k[1]);
+            if (v.length() >= 2 && v.charAt(0) == '"') v = v.substring(1, v.length() - 1);
+            return v;
+        }
+
+        static File child(File dir, String name) {
+            File f = new File(dir, name);
+            if (f.isFile()) return f;
+            File cur = dir;                              // any letter case, part by part (a/B/c.im)
+            for (String part : name.replace('\\', '/').split("/")) {
+                if (part.length() == 0) continue;
+                File next = new File(cur, part);
+                if (!next.exists()) {
+                    String[] l = cur.list();
+                    if (l != null) for (String x : l) if (x.equalsIgnoreCase(part)) next = new File(cur, x);
+                }
+                cur = next;
+            }
+            return cur.isFile() ? cur : f;
+        }
+
+        /** which of a.ditch0..3 the mesh file names (bit 0..3) */
+        static int ditchPoints(File mesh) throws IOException {
+            if (!mesh.isFile() || mesh.length() > 64L * 1024 * 1024) return 0;
+            byte[] d = new byte[(int) mesh.length()];
+            FileInputStream in = new FileInputStream(mesh);
+            try {
+                int o = 0, r;
+                while (o < d.length && (r = in.read(d, o, d.length - o)) > 0) o += r;
+            } finally {
+                in.close();
+            }
+            int bits = 0;
+            byte[] pat = "a.ditch".getBytes("ISO-8859-1");
+            outer:
+            for (int i = 0; i + pat.length < d.length; i++) {
+                for (int k = 0; k < pat.length; k++) if (d[i + k] != pat[k]) continue outer;
+                int dg = d[i + pat.length] - '0';
+                if (dg >= 0 && dg <= 3) bits |= 1 << dg;
+            }
+            return bits;
+        }
+
+        /** adds the TTS marker coronas to one loco; returns the number of lamps added */
+        static int patch(File dir, File cfg) throws IOException {
+            if (cfg.length() > 1024 * 1024) return 0;
+            byte[] raw = new byte[(int) cfg.length()];
+            FileInputStream in = new FileInputStream(cfg);
+            try {
+                int o = 0, r;
+                while (o < raw.length && (r = in.read(raw, o, raw.length - o)) > 0) o += r;
+            } finally {
+                in.close();
+            }
+            if (raw.length >= 2 && ((raw[0] & 0xFF) == 0xFF || (raw[0] & 0xFF) == 0xFE)) return 0;   // UTF-16: leave it
+            String s = new String(raw, "ISO-8859-1");
+            if (s.indexOf(TAG) >= 0) return 0;                     // done already
+            java.util.ArrayList<int[]> t = tokens(s);
+            // a locomotive: kind "traincar" with an engine
+            boolean traincar = false, engine = false;
+            int depth = 0;
+            for (int i = 0; i < t.size(); i++) {
+                String v = tok(s, t.get(i));
+                if (v.equals("{")) depth++;
+                else if (v.equals("}")) depth--;
+                else if (depth == 0 && i + 1 < t.size()) {
+                    String nx = tok(s, t.get(i + 1));
+                    if (v.equalsIgnoreCase("kind") && nx.equalsIgnoreCase("traincar")) traincar = true;
+                    if (v.equalsIgnoreCase("engine") && nx.equals("1")) engine = true;
+                }
+            }
+            if (!traincar || !engine) return 0;
+            // the mesh-table entry whose mesh has the ditch points
+            depth = 0;
+            int insertAt = -1, bits = 0;
+            boolean hasEffects = false;
+            for (int i = 0; i < t.size() && insertAt < 0; i++) {
+                String v = tok(s, t.get(i));
+                if (v.equals("{")) {
+                    depth++;
+                    continue;
+                }
+                if (v.equals("}")) {
+                    depth--;
+                    continue;
+                }
+                if (depth != 0 || !v.equalsIgnoreCase("mesh-table") || i + 1 >= t.size() || !tok(s, t.get(i + 1)).equals("{"))
+                    continue;
+                // walk the entries of the mesh-table
+                int j = i + 2, d2 = 1;
+                while (j < t.size() && d2 > 0 && insertAt < 0) {
+                    String w = tok(s, t.get(j));
+                    if (w.equals("}")) {
+                        d2--;
+                        j++;
+                        continue;
+                    }
+                    if (d2 == 1 && j + 1 < t.size() && tok(s, t.get(j + 1)).equals("{")) {
+                        // one entry: find its mesh, effects and end
+                        int k = j + 2, d3 = 1, effOpen = -1, close = -1;
+                        String mesh = null;
+                        while (k < t.size()) {
+                            String x = tok(s, t.get(k));
+                            if (x.equals("{")) d3++;
+                            else if (x.equals("}")) {
+                                d3--;
+                                if (d3 == 0) {
+                                    close = k;
+                                    break;
+                                }
+                            } else if (d3 == 1 && k + 1 < t.size()) {
+                                String y = tok(s, t.get(k + 1));
+                                if (x.equalsIgnoreCase("mesh") && !y.equals("{")) mesh = y;
+                                if (x.equalsIgnoreCase("effects") && y.equals("{")) effOpen = k + 1;
+                            }
+                            k++;
+                        }
+                        if (close < 0) break;
+                        if (mesh != null) {
+                            int b = ditchPoints(child(dir, mesh));
+                            if (b == 0 && mesh.toLowerCase(Locale.US).endsWith(".lm.txt")) {
+                                // level-of-detail list: look in the meshes it names
+                                File lm = child(dir, mesh);
+                                if (lm.isFile()) {
+                                    String lt = new String(readAll(lm), "ISO-8859-1");
+                                    java.util.regex.Matcher mm = java.util.regex.Pattern.compile("\"([^\"]+\\.(im|trainzmesh))\"",
+                                            java.util.regex.Pattern.CASE_INSENSITIVE).matcher(lt);
+                                    while (mm.find()) b |= ditchPoints(child(dir, mm.group(1)));
+                                }
+                            }
+                            if (b != 0) {
+                                bits = b;
+                                if (effOpen >= 0) {
+                                    insertAt = t.get(effOpen)[1];
+                                    hasEffects = true;
+                                } else insertAt = t.get(close)[0];
+                            }
+                        }
+                        d2 = 1;
+                        j = close + 1;
+                        continue;
+                    }
+                    j++;
+                }
+            }
+            if (insertAt < 0 || bits == 0) return 0;
+            String nl = s.indexOf("\r\n") >= 0 ? "\r\n" : "\n";
+            StringBuilder e = new StringBuilder();
+            int n = 0;
+            for (int i = 0; i < 4; i++) {
+                if ((bits & (1 << i)) == 0) continue;
+                String name = TAG + (i < 2 ? "front" : "back") + "_d" + i;
+                e.append(nl).append("      ").append(name).append(nl).append("      {").append(nl)
+                        .append("        kind                            \"corona\"").append(nl)
+                        .append("        att                             \"a.ditch").append(i).append("\"").append(nl)
+                        .append("        texture-kuid                    <kuid:-1:6338>").append(nl)
+                        .append("        object-size                     0.45").append(nl)
+                        .append("      }").append(nl);
+                n++;
+            }
+            String ins = hasEffects ? e.toString()
+                    : "  effects" + nl + "    {" + e.toString() + "    }" + nl + "  ";
+            String out = s.substring(0, insertAt) + ins + s.substring(insertAt);
+            File bak = new File(dir, "config.txt.ttsorig");
+            if (!bak.exists()) {
+                FileOutputStream o = new FileOutputStream(bak);
+                try {
+                    o.write(raw);
+                } finally {
+                    o.close();
+                }
+            }
+            File tmp = new File(dir, "config.txt.ttsnew");
+            FileOutputStream o = new FileOutputStream(tmp);
+            try {
+                o.write(out.getBytes("ISO-8859-1"));
+            } finally {
+                o.close();
+            }
+            if (!tmp.renameTo(cfg)) {
+                tmp.delete();
+                return 0;
+            }
+            return n;
+        }
+
+        static byte[] readAll(File f) throws IOException {
+            byte[] d = new byte[(int) Math.min(f.length(), 4L * 1024 * 1024)];
+            FileInputStream in = new FileInputStream(f);
+            try {
+                int o = 0, r;
+                while (o < d.length && (r = in.read(d, o, d.length - o)) > 0) o += r;
+            } finally {
+                in.close();
+            }
+            return d;
+        }
     }
 
     // r159: TTS built-in addons (assets/tts_addons/hash-XX/<asset folder>/...) are put once per version into
@@ -2081,6 +2398,8 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         // ---- optimistic states until the script confirms (ms time stamps)
         long cleanUntil, lightUntil[] = new long[8];
         boolean cleanWant, lightWant[] = new boolean[8];
+        long colUntil[] = new long[2];          // r162: marker colour (0 front, 1 back), optimistic until the script says
+        boolean colWant[] = new boolean[2];
         HudView view;
 
         static String[] split(String s, char c) {
@@ -2181,6 +2500,8 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                     lights = f;
                     for (int i = 0; i < 8; i++)
                         if (lightUntil[i] != 0 && i < 7 && (num(f[i], 0) != 0) == lightWant[i]) lightUntil[i] = 0;
+                    for (int e = 0; e < 2; e++)
+                        if (colUntil[e] != 0 && f.length > 9 + e && (num(f[9 + e], 0) != 0) == colWant[e]) colUntil[e] = 0;
                     changed = true;
                 }
             }
@@ -2308,6 +2629,16 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             boolean gs = f != null && num(f[5], 0) != 0;
             if (cleanUntil != 0 && System.currentTimeMillis() < cleanUntil) return cleanWant;
             cleanUntil = 0;
+            return gs;
+        }
+
+        /** r162: marker colour of an end (0 front, 1 back): true = red.  TTSHL fields 9 / 10; default front white, back red */
+        boolean colour(int end) {
+            String[] f = lights;
+            boolean gs = end == 1;
+            if (f != null && f.length > 9 + end) gs = num(f[9 + end], end) != 0;
+            if (colUntil[end] != 0 && System.currentTimeMillis() < colUntil[end]) return colWant[end];
+            colUntil[end] = 0;
             return gs;
         }
 
@@ -2499,6 +2830,14 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 case 21:
                     Hud.send(21);
                     break;
+                case 18:      // r162: front marker colour white <-> red
+                case 19: {    //       back marker colour
+                    int e = a - 18;
+                    h.colWant[e] = !h.colour(e);
+                    h.colUntil[e] = now + 1500;
+                    Hud.send(a);
+                    break;
+                }
                 default:
                     if (a >= 10 && a <= 17) {
                         int i = LIGHT_IDX[a - 10];
@@ -2887,48 +3226,106 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             }
         }
 
-        static final String[] LIGHT_NAME = {"Headlights", "High beam", "Marker lights", "Marker front", "Marker back",
-                "Flasher front", "Flasher back", "Emergency flasher"};
         static final int[] LIGHT_CMD = {10, 17, 11, 12, 13, 14, 15, 16};
-        static final int[] ROW_FIELD = {0, 1, -1, 2, 3, 4, 5, 6};     // TTSHL field of each row (-1 = both markers)
+
+        // r162: CONTROL PANEL (was LIGHTS): grouped rows, marker colour per end (white / red)
+        void section(Canvas c, String title, float L, float y, float panelW, float fsSmall) {
+            text(c, title, L + 10 * sc, y, fsSmall, 0xFFFFB733, true, panelW - 20 * sc);
+            box(c, L + 10 * sc, y + fsSmall * 1.25f, panelW - 20 * sc, 1.5f * sc, 0x55FFB733);
+        }
+
+        void toggleRow(Canvas c, String label, boolean on, int cmd, float L, float y, float panelW, float rh, float fs,
+                       float rightRoom) {
+            box(c, L + 6 * sc, y, panelW - 12 * sc, rh, on ? 0xF0143C28 : 0xF0162440);
+            box(c, L + 6 * sc, y, 4 * sc, rh, on ? 0xFF38E07B : 0xFF3A4A66);
+            text(c, label, L + 16 * sc, y + (rh - fs) / 2, fs * 0.92f, on ? 0xFFFFFFFF : 0xFFB8C4D6, false,
+                    panelW - rightRoom - 30 * sc);
+            float sw = rh * 1.15f, sh = rh * 0.52f, sx = L + panelW - sw - 12 * sc, sy = y + (rh - sh) / 2;
+            p.setStyle(Paint.Style.FILL);
+            p.setColor(on ? 0xFF38E07B : 0xFF46546E);
+            r.set(sx, sy, sx + sw, sy + sh);
+            c.drawRoundRect(r, sh / 2, sh / 2, p);
+            p.setColor(0xFFFFFFFF);
+            c.drawCircle(on ? sx + sw - sh / 2 : sx + sh / 2, sy + sh / 2, sh / 2 - 2 * sc, p);
+            hit(L, y, L + panelW, y + rh, cmd);
+        }
+
+        /** the WHITE / RED chooser of a marker row (tap = the other colour) */
+        void colourChip(Canvas c, boolean red, int cmd, float L, float y, float panelW, float rh, float fsSmall) {
+            float cw = rh * 2.9f, ch = rh * 0.64f;
+            float cx = L + panelW - rh * 1.15f - 12 * sc - cw - 8 * sc, cy = y + (rh - ch) / 2;
+            p.setStyle(Paint.Style.FILL);
+            p.setColor(0xFF0B1322);
+            r.set(cx, cy, cx + cw, cy + ch);
+            c.drawRoundRect(r, ch / 2, ch / 2, p);
+            float half = cw / 2;
+            p.setColor(red ? 0xFFE0383F : 0xFFF2F2EA);
+            float hx = red ? cx + half : cx;
+            r.set(hx + 2 * sc, cy + 2 * sc, hx + half - 2 * sc, cy + ch - 2 * sc);
+            c.drawRoundRect(r, ch / 2, ch / 2, p);
+            float ts = Math.min(fsSmall * 0.82f, ch * 0.52f);
+            p.setTextSize(ts);
+            p.setFakeBoldText(true);
+            float wW = p.measureText("WHITE"), wR = p.measureText("RED");
+            text(c, "WHITE", cx + (half - wW) / 2, cy + (ch - ts) / 2, ts, red ? 0xFF8A97AD : 0xFF10202E, true, 0);
+            text(c, "RED", cx + half + (half - wR) / 2, cy + (ch - ts) / 2, ts, red ? 0xFFFFFFFF : 0xFF8A97AD, true, 0);
+            hit(cx - 6 * sc, y, cx + cw + 6 * sc, y + rh, cmd);
+        }
 
         void drawLights(Canvas c, Hud h, int side, float ppi, float fs, float fsSmall, float rowH, float W, float Hh) {
-            float step = rowH + 16 * sc, panelW = 0.95f * ppi;
-            float panelH = h.lightsOn ? rowH + 14 * sc + 8 * step + 3 * rowH + 6 * sc : rowH + 8 * sc;
-            float top = Hh * 0.30f;
-            if (top + panelH > Hh - 0.6f * ppi) top = Hh - 0.6f * ppi - panelH;
+            float step = rowH + 14 * sc, panelW = 1.12f * ppi, rh = step - 4 * sc, sec = fsSmall * 1.9f;
+            float bodyH = 8 * step + 3 * sec + 1.3f * rowH + 4 * sc;
+            float panelH = h.lightsOn ? rowH + 8 * sc + bodyH : rowH + 8 * sc;
+            float top = Hh * 0.22f;
+            if (top + panelH > Hh - 0.45f * ppi) top = Hh - 0.45f * ppi - panelH;
             if (top < 40 * sc) top = 40 * sc;
             float L = side == 0 ? W - panelW - 4 * sc : 4 * sc;
             // r127: beside the TTS screenshot / record knobs instead of on top of them
             float orr = obstacleRight(L, L + panelW, top, top + panelH, side == 0);
             if (orr >= 0) L = side == 0 ? orr - panelW - 6 * sc : orr + 6 * sc;
-            if (h.lightsOn) box(c, L, top, panelW, panelH, 0xE60A1424);
-            box(c, L, top, panelW, rowH + 4 * sc, 0xF412284A);
-            box(c, L, top, 4 * sc, rowH + 4 * sc, 0xFFFF8A1E);
-            text(c, "LIGHTS  " + (h.lightsOn ? "[-]" : "[+]"), L + 8 * sc, top + 3 * sc, fs, 0xFFFFB733, false, panelW - 12 * sc);
-            hit(L, top, L + panelW, top + rowH + 4 * sc, 6);
-            if (!h.lightsOn) return;
-            float y = top + rowH + 10 * sc;
-            for (int i = 0; i < 8; i++) {
-                boolean on = ROW_FIELD[i] < 0 ? (h.light(2) && h.light(3)) : h.light(ROW_FIELD[i]);
-                float rh = step - 4 * sc;
-                box(c, L + 6 * sc, y, panelW - 12 * sc, rh, on ? 0xF0143C28 : 0xF0162440);
-                box(c, L + 6 * sc, y, 4 * sc, rh, on ? 0xFF38E07B : 0xFF3A4A66);
-                text(c, LIGHT_NAME[i], L + 16 * sc, y + (rh - fs) / 2, fs * 0.92f, on ? 0xFFFFFFFF : 0xFFB8C4D6, false, panelW - 0.30f * ppi);
-                float sw = 0.20f * ppi, sh = rh * 0.52f, sx = L + panelW - sw - 12 * sc, sy = y + (rh - sh) / 2;
+            if (h.lightsOn) {
                 p.setStyle(Paint.Style.FILL);
-                p.setColor(on ? 0xFF38E07B : 0xFF46546E);
-                r.set(sx, sy, sx + sw, sy + sh);
-                c.drawRoundRect(r, sh / 2, sh / 2, p);
-                p.setColor(0xFFFFFFFF);
-                c.drawCircle(on ? sx + sw - sh / 2 : sx + sh / 2, sy + sh / 2, sh / 2 - 2 * sc, p);
-                hit(L, y, L + panelW, y + rh, LIGHT_CMD[i]);
-                y += step;
+                p.setColor(0xEA0A1424);
+                r.set(L, top, L + panelW, top + panelH);
+                c.drawRoundRect(r, 10 * sc, 10 * sc, p);
             }
-            y += 4 * sc;
+            p.setStyle(Paint.Style.FILL);
+            p.setColor(0xF412284A);
+            r.set(L, top, L + panelW, top + rowH + 6 * sc);
+            c.drawRoundRect(r, 10 * sc, 10 * sc, p);
+            box(c, L, top + 4 * sc, 4 * sc, rowH - 2 * sc, 0xFFFF8A1E);
+            text(c, "CONTROL PANEL", L + 12 * sc, top + 4 * sc, fs, 0xFFFFB733, true, panelW - 0.4f * ppi);
+            text(c, h.lightsOn ? "[-]" : "[+]", L + panelW - 0.32f * ppi, top + 4 * sc, fs, 0xFFFFB733, true, 0);
+            hit(L, top, L + panelW, top + rowH + 6 * sc, 6);
+            if (!h.lightsOn) return;
+            float y = top + rowH + 12 * sc;
+            section(c, "HEADLIGHT", L, y, panelW, fsSmall);
+            y += sec;
+            toggleRow(c, "Headlights", h.light(0), 10, L, y, panelW, rh, fs, 0);
+            y += step;
+            toggleRow(c, "High beam", h.light(1), 17, L, y, panelW, rh, fs, 0);
+            y += step;
+            section(c, "MARKER LIGHTS", L, y, panelW, fsSmall);
+            y += sec;
+            float chipRoom = rh * 2.9f + 16 * sc;
+            toggleRow(c, "Front", h.light(2), 12, L, y, panelW, rh, fs, chipRoom);
+            colourChip(c, h.colour(0), 18, L, y, panelW, rh, fsSmall);
+            y += step;
+            toggleRow(c, "Back", h.light(3), 13, L, y, panelW, rh, fs, chipRoom);
+            colourChip(c, h.colour(1), 19, L, y, panelW, rh, fsSmall);
+            y += step;
+            toggleRow(c, "Both ends", h.light(2) && h.light(3), 11, L, y, panelW, rh, fs, 0);
+            y += step;
+            section(c, "FLASHERS", L, y, panelW, fsSmall);
+            y += sec;
+            toggleRow(c, "Flasher front", h.light(4), 14, L, y, panelW, rh, fs, 0);
+            y += step;
+            toggleRow(c, "Flasher back", h.light(5), 15, L, y, panelW, rh, fs, 0);
+            y += step;
+            toggleRow(c, "Emergency flasher", h.light(6), 16, L, y, panelW, rh, fs, 0);
+            y += step + 2 * sc;
             String[] lf = h.lights;
-            text(c, lf != null ? lf[8] : "", L + 6 * sc, y, fsSmall, 0xFF93A7C2, false, panelW - 12 * sc);
-            text(c, "Each light works on its own", L + 6 * sc, y + rowH, fsSmall, 0xFF46584C, false, panelW - 12 * sc);
+            text(c, lf != null && lf.length > 8 ? lf[8] : "", L + 8 * sc, y, fsSmall, 0xFF93A7C2, false, panelW - 16 * sc);
         }
     }
 
