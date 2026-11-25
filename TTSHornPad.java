@@ -502,6 +502,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             TTSSms.setPaused(false);
             hud.resume();
             boost.start();
+            watchRecording(a);
         } catch (Throwable t) {
             log("attach: " + t);
         }
@@ -581,6 +582,8 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         long pos = -1;
         String lastLine = "";
         String loadedKuid = null;
+        boolean loadFailed;                // r164
+        long loadFailAt;
         volatile State last;                         // the latest state (a new pad starts from it)
         File base;                                   // .../files (UserData lives under it)
         final HashMap<String, File> kuidDirs = new HashMap<String, File>();
@@ -821,11 +824,15 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
 
         void apply(final State st) {
             last = st;
-            if (st.on && !st.kuid.equals(loadedKuid)) {
+            if (st.on && (!st.kuid.equals(loadedKuid) || (loadFailed && System.currentTimeMillis() - loadFailAt > 8000))) {
                 loadedKuid = st.kuid;
                 File dir = findDir(st.kuid);
-                mixer.load(dir);
-                log("horn folder " + st.kuid + " -> " + dir);
+                boolean ok = mixer.load(dir);
+                // r164: a sound that could not be read (his log: OutOfMemoryError on horn.wav) left the pad
+                // silent for that loco until another loco was driven - now it is read again 8 s later
+                loadFailed = !ok;
+                loadFailAt = System.currentTimeMillis();
+                log("horn folder " + st.kuid + " -> " + dir + (ok ? "" : " (a sound failed, retry in 8 s)"));
             }
             H.post(new Runnable() {
                 public void run() {
@@ -1031,7 +1038,10 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         return runs;
     }
 
+    static volatile boolean readWavOom;      // r164: the last readWav failed for lack of memory
+
     static Snd readWav(File f) {
+        readWavOom = false;
         try {
             if (f == null || !f.isFile() || f.length() > (40L << 20)) return null;
             byte[] b = new byte[(int) f.length()];
@@ -1109,6 +1119,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             loudness(s);
             return s;
         } catch (Throwable t) {
+            readWavOom = t instanceof OutOfMemoryError;
             log("wav " + f + ": " + t);
             return null;
         }
@@ -1462,8 +1473,16 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             }
         }
 
-        void load(File dir) {
+        boolean load(File dir) {
             Snd[] n = new Snd[5];
+            boolean ok = true;
+            synchronized (lock) {                          // r164: let the old loco's sounds go before reading new ones
+                for (int k = 1; k <= 4; k++) {
+                    snd[k] = null;
+                    has[k] = false;
+                    v[k] = null;
+                }
+            }
             if (dir != null && dir.isDirectory()) {
                 File[] files = dir.listFiles();
                 HashMap<String, File> byName = new HashMap<String, File>();
@@ -1475,6 +1494,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                             n[k] = readWav(f);
                             if (n[k] != null && k == 3) bellLoop(n[k]);   // r153: bell loops like stock Trainz
                             if (n[k] != null) break;
+                            if (readWavOom) ok = false;
                         }
                     }
                 }
@@ -1491,6 +1511,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                     if (pad != null) pad.invalidate();
                 }
             });
+            return ok;
         }
 
         boolean has(int k) {
@@ -3519,6 +3540,111 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             } catch (Throwable e) {
                 endSession();
             }
+        }
+    }
+
+    // ================================================================ r164: phone screen recording = clean video
+    /**
+     * Android 15+ tells an app when its window is being screen-recorded (WindowManager.addScreenRecordingCallback,
+     * permission DETECT_SCREEN_RECORDING in the manifest).  While the phone's recorder runs, the TTS overlays (HUD,
+     * CONTROL PANEL, horn pad, TTS camera bar / knobs) are made fully transparent: they are not in the video, and a
+     * finger on their place still works.  The TTS recorder (record knob) is not affected: it keeps the HUD (r127).
+     * Reflection only, so the dex builds with any android.jar.
+     */
+    static Object recCb;
+    static Activity recFor;
+    static volatile boolean recOn;
+    static final java.util.WeakHashMap<View, Float> recAlpha = new java.util.WeakHashMap<View, Float>();
+
+    static void watchRecording(Activity a) {
+        if (android.os.Build.VERSION.SDK_INT < 35 || a == null || a == recFor) return;
+        try {
+            Class<?> cc = Class.forName("java.util.function.Consumer");
+            if (recCb != null && recFor != null) {
+                try {
+                    Object owm = recFor.getWindowManager();
+                    owm.getClass().getMethod("removeScreenRecordingCallback", cc).invoke(owm, recCb);
+                } catch (Throwable t) {
+                    // old activity gone
+                }
+            }
+            recCb = Proxy.newProxyInstance(cc.getClassLoader(), new Class<?>[]{cc}, new InvocationHandler() {
+                public Object invoke(Object p, Method m, Object[] args) {
+                    String n = m.getName();
+                    if ("accept".equals(n) && args != null && args.length == 1) {
+                        final boolean on = Integer.valueOf(1).equals(args[0]);
+                        H.post(new Runnable() {
+                            public void run() {
+                                setRecording(on);
+                            }
+                        });
+                        return null;
+                    }
+                    if ("hashCode".equals(n)) return System.identityHashCode(p);
+                    if ("equals".equals(n)) return args != null && args.length == 1 && p == args[0];
+                    if ("toString".equals(n)) return "TTSRecWatch";
+                    return null;
+                }
+            });
+            Object wm = a.getWindowManager();
+            Method add = wm.getClass().getMethod("addScreenRecordingCallback", java.util.concurrent.Executor.class, cc);
+            Object st = add.invoke(wm, new java.util.concurrent.Executor() {
+                public void execute(Runnable r) {
+                    H.post(r);
+                }
+            }, recCb);
+            recFor = a;
+            log("rec watch: on, state " + st);
+            setRecording(Integer.valueOf(1).equals(st));
+        } catch (Throwable t) {
+            log("rec watch: " + t);
+        }
+    }
+
+    static final Runnable recTick = new Runnable() {
+        public void run() {
+            if (!recOn) return;
+            applyRecording(true);                         // views added while recording (pad shown, menus ...)
+            H.postDelayed(this, 500);
+        }
+    };
+
+    static void setRecording(boolean on) {
+        if (on == recOn) return;
+        recOn = on;
+        log("rec: phone screen recording " + (on ? "started - TTS overlays hidden" : "stopped - TTS overlays back"));
+        applyRecording(on);
+        H.removeCallbacks(recTick);
+        if (on) H.postDelayed(recTick, 500);
+    }
+
+    static void applyRecording(boolean on) {
+        try {
+            if (!on) {
+                for (java.util.Map.Entry<View, Float> e : recAlpha.entrySet()) {
+                    View v = e.getKey();
+                    if (v != null) v.setAlpha(e.getValue());
+                }
+                recAlpha.clear();
+                return;
+            }
+            Activity a = owner;
+            if (a == null) return;
+            View c = a.findViewById(android.R.id.content);
+            if (!(c instanceof ViewGroup)) return;
+            ViewGroup g = (ViewGroup) c;
+            HudView hv = hud.view;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                View v = g.getChildAt(i);
+                if (v instanceof android.view.SurfaceView || v instanceof android.view.TextureView) continue;
+                boolean ours = v == hv || v == pad;
+                // other TTS controls (camera bar, knobs) are small; anything as big as the screen may be the game
+                if (!ours && (v.getWidth() > g.getWidth() * 0.9f && v.getHeight() > g.getHeight() * 0.7f)) continue;
+                if (!recAlpha.containsKey(v)) recAlpha.put(v, v.getAlpha());
+                if (v.getAlpha() != 0f) v.setAlpha(0f);
+            }
+        } catch (Throwable t) {
+            log("rec hide: " + t);
         }
     }
 

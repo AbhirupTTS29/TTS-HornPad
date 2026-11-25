@@ -1808,7 +1808,9 @@ public final class TTSSms {
         int dataOff, frames, rate, bits, ch;
         int[] cues;         // sample frames, sorted (Open Rails: chunk + block + sample offset)
         boolean origMono;
-        float[] fl;         // r158: a clipped recording, repaired (de-clipped, -3 dB) - read from here instead
+        java.nio.ShortBuffer sfl;   // r158: a clipped recording, repaired (de-clipped, -3 dB) - read from here instead
+                                    // r164: 16-bit in native memory (was a float[] on the Java heap: big track sound
+                                    // packs filled the 256 MB heap -> horn pad sounds / font glyphs failed, game crash)
         String name = "";
 
         // r158: one mapping per file for every sound set (the AC / non-AC sets and both .sms of an asset share
@@ -1843,7 +1845,7 @@ public final class TTSSms {
                     while (true) {
                         try {
                             Wav x = PF.take();
-                            if (x.fl != null) continue;
+                            if (x.sfl != null) continue;
                             int bytes = Math.min(x.frames, x.rate) * x.ch * (x.bits / 8);
                             int sum = 0;
                             for (int i = 0; i < bytes; i += 4096) sum += x.bb.get(x.dataOff + i);
@@ -1871,40 +1873,63 @@ public final class TTSSms {
                 if (v >= 0.995f || v <= -0.995f) clipped++;
             }
             if (clipped < 32) return;
-            float[] x = new float[frames];
-            for (int i = 0; i < frames; i++) x[i] = raw(i);
+            // r164: two passes straight from the mapped file (peak first, then the scaled 16-bit copy), nothing
+            // of the size of the file on the Java heap
+            float[] pk = new float[1];
+            declipPass(null, 1f, pk);
+            float g = Math.min(0.708f, 0.98f / Math.max(pk[0], 1e-6f));
+            java.nio.ShortBuffer out = java.nio.ByteBuffer.allocateDirect(frames * 2).order(ByteOrder.nativeOrder()).asShortBuffer();
+            int runs = declipPass(out, g, pk);
+            sfl = out;
+            TTSHornPad.log("sms: " + name + " was clipped (" + clipped + " samples, " + runs + " runs): repaired, x" + String.format(Locale.US, "%.2f", g));
+        }
+
+        /** one walk over the file: rebuilds the flat-topped runs (cubic through the neighbours); writes x g into out */
+        int declipPass(java.nio.ShortBuffer out, float g, float[] peak) {
             int runs = 0;
-            int i = 1;
-            while (i < frames - 2) {
-                if (Math.abs(x[i]) >= 0.995f) {
+            float pk = 0f;
+            int i = 0;
+            while (i < frames) {
+                float v = raw(i);
+                if (i >= 2 && i < frames - 3 && Math.abs(v) >= 0.995f) {
                     int a = i, b = i;
-                    float sg = Math.signum(x[i]);
-                    while (b + 1 < frames - 2 && Math.abs(x[b + 1]) >= 0.995f && Math.signum(x[b + 1]) == sg) b++;
-                    if (b > a && a >= 2) {
+                    float sg = Math.signum(v);
+                    while (b + 1 < frames - 3 && Math.abs(raw(b + 1)) >= 0.995f && Math.signum(raw(b + 1)) == sg) b++;
+                    if (b > a) {
                         int L = b - a + 2;                       // from a-1 to b+1
-                        float p0 = x[a - 1], p1 = x[b + 1];
-                        float m0 = (x[a - 1] - x[a - 2]) * L, m1 = (x[b + 2] - x[b + 1]) * L;
+                        float p0 = raw(a - 1), p1 = raw(b + 1);
+                        float m0 = (raw(a - 1) - raw(a - 2)) * L, m1 = (raw(b + 2) - raw(b + 1)) * L;
                         for (int k = a; k <= b; k++) {
                             float t = (float) (k - (a - 1)) / L;
                             float t2 = t * t, t3 = t2 * t;
                             float y = (2 * t3 - 3 * t2 + 1) * p0 + (t3 - 2 * t2 + t) * m0 + (-2 * t3 + 3 * t2) * p1 + (t3 - t2) * m1;
-                            if (sg > 0 && y < x[k]) y = x[k];
-                            if (sg < 0 && y > x[k]) y = x[k];
+                            float xk = raw(k);
+                            if (sg > 0 && y < xk) y = xk;
+                            if (sg < 0 && y > xk) y = xk;
                             if (y > 1.6f) y = 1.6f;
                             if (y < -1.6f) y = -1.6f;
-                            x[k] = y;
+                            pk = Math.max(pk, Math.abs(y));
+                            if (out != null) out.put(k, q16(y * g));
                         }
                         runs++;
+                    } else {
+                        pk = Math.max(pk, Math.abs(v));
+                        if (out != null) out.put(a, q16(v * g));
                     }
                     i = b + 1;
-                } else i++;
+                } else {
+                    pk = Math.max(pk, Math.abs(v));
+                    if (out != null) out.put(i, q16(v * g));
+                    i++;
+                }
             }
-            float peak = 0f;
-            for (float v : x) peak = Math.max(peak, Math.abs(v));
-            float g = Math.min(0.708f, 0.98f / Math.max(peak, 1e-6f));
-            for (int k = 0; k < frames; k++) x[k] *= g;
-            fl = x;
-            TTSHornPad.log("sms: " + name + " was clipped (" + clipped + " samples, " + runs + " runs): repaired, x" + String.format(Locale.US, "%.2f", g));
+            peak[0] = pk;
+            return runs;
+        }
+
+        static short q16(float v) {
+            int q = Math.round(v * 32767f);
+            return (short) (q > 32767 ? 32767 : q < -32768 ? -32768 : q);
         }
 
         float raw(int f) {
@@ -1997,7 +2022,7 @@ public final class TTSSms {
 
         float at(int f) {
             if (f < 0 || f >= frames) return 0f;
-            if (fl != null) return fl[f];
+            if (sfl != null) return sfl.get(f) * (1f / 32768f);
             if (bits == 16) {
                 int q = dataOff + f * 2 * ch + (ch == 2 ? 2 : 0);
                 return bb.getShort(q) * (1f / 32768f);
