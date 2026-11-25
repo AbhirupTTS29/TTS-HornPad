@@ -679,6 +679,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             hud.fromLog(s);
             camFromLog(s);
             TTSSms.fromLog(s, base, this);              // r136: Open Rails .sms engine sound
+            doorSnd.fromLog(s, this);                   // r170: door_open.wav / door_close.wav of the vehicle's asset folder
             int i = s.lastIndexOf("TTSJOY: o");
             // the driver session ended (back to the menu, Surveyor / edit session): the game's script
             // router shuts down and the HUD script never gets to write "off" - hide the pad ourselves
@@ -3828,6 +3829,135 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             }
         } catch (Throwable t) {
             log("rec hide: " + t);
+        }
+    }
+
+    // ================================================================ r170: door sounds
+    /**
+     * The HUD script logs "TTSDOOR: o|c <kuid> d=<metres>" when a vehicle's door animation starts opening / closing.
+     * The asset folder (next to config.txt) is looked up here: door_open.wav / door_close.wav that exist are played
+     * once, quieter with the distance from the camera; a vehicle without the file is silent (the game script itself
+     * cannot ask whether a file exists, and playing a missing file there throws a script error).
+     */
+    static final DoorSnd doorSnd = new DoorSnd();
+
+    static final class DoorSnd {
+        final HashMap<String, Snd> cache = new HashMap<String, Snd>();
+        final HashMap<String, Long> missAt = new HashMap<String, Long>();
+        int active;
+        int logged;
+
+        void fromLog(String s, Watcher w) {
+            int i = s.indexOf("TTSDOOR: ");
+            if (i < 0) return;
+            java.util.ArrayList<String[]> ev = new java.util.ArrayList<String[]>();
+            while (i >= 0 && ev.size() < 40) {
+                int e = s.indexOf('\n', i);
+                if (e < 0) e = s.length();
+                String l = s.substring(i + 9, e).trim();
+                String[] f = l.split("\\s+");
+                if (f.length >= 2 && (f[0].equals("o") || f[0].equals("c"))) ev.add(f);
+                i = s.indexOf("TTSDOOR: ", e);
+            }
+            if (ev.isEmpty()) return;
+            // the nearest first, at most 6 voices at once
+            java.util.Collections.sort(ev, new java.util.Comparator<String[]>() {
+                public int compare(String[] a, String[] b) {
+                    return Integer.compare(dist(a), dist(b));
+                }
+            });
+            int played = 0;
+            for (String[] f : ev) {
+                if (played >= 6) break;
+                if (play(f, w)) played++;
+            }
+        }
+
+        static int dist(String[] f) {
+            for (String t : f) if (t.startsWith("d=")) return Hud.num(t.substring(2), 50);
+            return 50;
+        }
+
+        boolean play(String[] f, Watcher w) {
+            try {
+                boolean open = f[0].equals("o");
+                String kuid = Watcher.normKuid(f[1]);
+                if (kuid.length() == 0) return false;
+                File dir = w.findDir(kuid);
+                if (dir == null) return false;
+                String want = open ? "door_open.wav" : "door_close.wav";
+                String key = dir.getPath() + "|" + want;
+                Snd sd;
+                synchronized (cache) {
+                    sd = cache.get(key);
+                    Long ma = missAt.get(key);
+                    if (sd == null && ma != null && System.currentTimeMillis() - ma < 30000) return false;
+                }
+                if (sd == null) {
+                    File[] fs = dir.listFiles();
+                    File found = null;
+                    if (fs != null) for (File x : fs) if (x.getName().equalsIgnoreCase(want)) found = x;
+                    if (found != null) sd = readWav(found);
+                    synchronized (cache) {
+                        if (sd == null) {
+                            missAt.put(key, System.currentTimeMillis());
+                            if (found != null) log("door sound " + found + ": not a readable wav");
+                            return false;
+                        }
+                        cache.put(key, sd);
+                    }
+                    if (logged++ < 20) log("door sound: " + want + " of " + dir.getName());
+                }
+                int d = dist(f);
+                float g = d <= 4 ? 1f : Math.max(0f, 1f - (d - 4) / 70f);
+                g = g * g;
+                if (g < 0.02f) return false;
+                if (active >= 8) return false;
+                start(sd, g);
+                return true;
+            } catch (Throwable t) {
+                log("door sound: " + t);
+                return false;
+            }
+        }
+
+        void start(final Snd sd, final float gain) {
+            final byte[] b = new byte[sd.frames * 4];
+            for (int i = 0; i < sd.frames * 2; i++) {
+                short v = sd.pcm[i];
+                b[2 * i] = (byte) (v & 255);
+                b[2 * i + 1] = (byte) (v >> 8 & 255);
+            }
+            synchronized (this) {
+                active++;
+            }
+            new Thread(new Runnable() {
+                public void run() {
+                    AudioTrack t = null;
+                    try {
+                        t = new AudioTrack(AudioManager.STREAM_MUSIC, RATE, AudioFormat.CHANNEL_OUT_STEREO,
+                                AudioFormat.ENCODING_PCM_16BIT, b.length, AudioTrack.MODE_STATIC);
+                        t.write(b, 0, b.length);
+                        t.setStereoVolume(gain, gain);
+                        t.play();
+                        Thread.sleep(sd.frames * 1000L / RATE + 250);
+                    } catch (Throwable x) {
+                        log("door play: " + x);
+                    } finally {
+                        try {
+                            if (t != null) {
+                                t.stop();
+                                t.release();
+                            }
+                        } catch (Throwable x) {
+                            // gone
+                        }
+                        synchronized (DoorSnd.this) {
+                            active--;
+                        }
+                    }
+                }
+            }, "TTSDoorSnd").start();
         }
     }
 
