@@ -1504,7 +1504,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                         File f = byName.get(nm);
                         if (f != null) {
                             n[k] = readWav(f);
-                            if (n[k] != null && k == 3) bellLoop(n[k]);   // r153: bell loops like stock Trainz
+                            // TTS base: the bell plays like the horn / sander (steady-part loop while held, ending on let-go)
                             if (n[k] != null) break;
                             if (readWavOom) ok = false;
                         }
@@ -2404,7 +2404,10 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
         volatile int[] prof;                  // here + 20 columns (dm), Integer.MIN_VALUE = no data
         volatile String[] lights;             // TTSHL fields
         volatile String[] msts;               // r166: TTSMS fields (MSTS vehicles of the driven train)
-        int cpPage;                           // r166: CONTROL PANEL page, 0 LIGHTS / 1 LOCO / 2 POINTS (r171)
+        int cpPage;                           // r166: CONTROL PANEL page, 0 LIGHTS / 1 LOCO / 2 POINTS (r171) / 3 OTHERS
+        volatile String[] mo;                 // TTS base: TTSMO fields  n ^ on-bits ^ name0 ^ name1 ...
+        long moUntil[] = new long[12];
+        boolean moWant[] = new boolean[12];
         volatile int[] swDist = new int[0], swDir = new int[0];   // r171: TTSSW junctions ahead
         long swUntil[] = new long[5];
         int swWant[] = new int[5];
@@ -2552,7 +2555,37 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                     changed = true;
                 }
             }
+            l = lineAfter(s, "TTSMO: ");
+            if (l != null && s.lastIndexOf("TTSMO: ") > done) {
+                String[] f = split(l, '^');
+                if (f.length >= 2) {
+                    mo = f;
+                    int a = num(f[1], 0);
+                    for (int i = 0; i < 12; i++)
+                        if (moUntil[i] != 0 && ((a >> i & 1) != 0) == moWant[i]) moUntil[i] = 0;
+                    changed = true;
+                }
+            }
             if (changed) refresh();
+        }
+
+        /** TTS base: OTHERS - number of switches, name and state of switch i (any .kin of the train) */
+        int moN() {
+            String[] f = mo;
+            return f != null && f.length >= 2 ? Math.min(12, Math.min(num(f[0], 0), f.length - 2)) : 0;
+        }
+
+        String moName(int i) {
+            String[] f = mo;
+            return f != null && f.length > i + 2 ? f[i + 2] : "";
+        }
+
+        boolean mo(int i) {
+            String[] f = mo;
+            boolean gs = f != null && f.length > 1 && (num(f[1], 0) >> i & 1) != 0;
+            if (moUntil[i] != 0 && System.currentTimeMillis() < moUntil[i]) return moWant[i];
+            moUntil[i] = 0;
+            return gs;
         }
 
         /** r166: MSTS switch i (0 panto front, 1 panto back, 2 doors left, 3 doors right, 4 wiper, 5 mirror) */
@@ -2692,7 +2725,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 compact = sp.getBoolean("compact", false);
                 lightsOn = sp.getBoolean("lightsOn", true);
                 hideAll = sp.getBoolean("hideAll", false);
-                cpPage = Math.max(0, Math.min(2, sp.getInt("cpPage", 0)));
+                cpPage = Math.max(0, Math.min(3, sp.getInt("cpPage", 0)));
             } catch (Throwable e) {
                 log("hud prefs: " + e);
             }
@@ -2913,9 +2946,10 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                 case 21:
                     Hud.send(21);
                     break;
-                case 50:      // r166: CONTROL PANEL tabs (r171: + POINTS, CAM)
+                case 50:      // r166: CONTROL PANEL tabs (r171: + POINTS; base: + OTHERS)
                 case 51:
                 case 52:
+                case 53:
                     h.cpPage = a - 50;
                     break;
                 case 40:      // r171: throw a junction ahead
@@ -2966,7 +3000,12 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
                     break;
                 }
                 default:
-                    if (a >= 10 && a <= 17) {
+                    if (a >= 70 && a <= 81) {             // TTS base: OTHERS switch (any animation)
+                        int i = a - 70;
+                        h.moWant[i] = !h.mo(i);
+                        h.moUntil[i] = now + 2500;
+                        Hud.send(a);
+                    } else if (a >= 10 && a <= 17) {
                         int i = LIGHT_IDX[a - 10];
                         if (i >= 0) {
                             h.lightWant[i] = !h.light(i);
@@ -3412,6 +3451,45 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             return rows * step + secs * sec + 1.3f * rowH + 4 * sc;
         }
 
+        /** TTS base: OTHERS page - one switch per animation (.kin name), two columns when there are more than 6 */
+        float othersH(Hud h, float step, float sec, float rowH) {
+            int n = h.moN();
+            int rows = n == 0 ? 1 : (n > 6 ? (n + 1) / 2 : n);
+            return sec + rows * step + 1.3f * rowH + 4 * sc;
+        }
+
+        void drawOthers(Canvas c, Hud h, float L, float y, float panelW, float rh, float step, float sec, float fs, float fsSmall) {
+            section(c, "OTHER ANIMATIONS", L, y, panelW, fsSmall);
+            y += sec;
+            int n = h.moN();
+            if (n == 0) {
+                text(c, "No other animations in this train", L + 12 * sc, y + (rh - fs) / 2, fs * 0.9f, 0xFF93A7C2, false, panelW - 24 * sc);
+                y += step;
+            } else if (n <= 6) {
+                for (int i = 0; i < n; i++) {
+                    toggleRow(c, pretty(h.moName(i)), h.mo(i), 70 + i, L, y, panelW, rh, fs, 0);
+                    y += step;
+                }
+            } else {
+                float half = panelW / 2f;
+                for (int i = 0; i < n; i++) {
+                    float x = L + (i % 2) * (half - 3 * sc);
+                    toggleRow(c, pretty(h.moName(i)), h.mo(i), 70 + i, x, y, half + 3 * sc, rh, fs * 0.86f, 0);
+                    if (i % 2 == 1 || i == n - 1) y += step;
+                }
+            }
+            y += 2 * sc;
+            text(c, "On = plays in a loop. Named after the .kin file.", L + 8 * sc, y, fsSmall, 0xFF93A7C2, false, panelW - 16 * sc);
+        }
+
+        /** "driver_wave" -> "Driver wave" */
+        static String pretty(String s) {
+            if (s == null || s.length() == 0) return "Animation";
+            String t = s.replace('_', ' ').replace('-', ' ').trim();
+            if (t.length() == 0) return s;
+            return Character.toUpperCase(t.charAt(0)) + t.substring(1);
+        }
+
         /** r166: OFF / DIM / BRIGHT chooser (commands 36 / 37 / 38) */
         void segRow(Canvas c, int sel, float L, float y, float panelW, float rh, float fsSmall) {
             String[] nm = {"OFF", "DIM", "BRIGHT"};
@@ -3523,6 +3601,7 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             float step = rowH + 14 * sc, panelW = 1.12f * ppi, rh = step - 4 * sc, sec = fsSmall * 1.9f;
             float tabH = rh * 0.85f + 8 * sc;
             float bodyH = h.cpPage == 1 ? locoH(h, step, sec, rowH)
+                    : h.cpPage == 3 ? othersH(h, step, sec, rowH)
                     : h.cpPage == 2 ? sec + Math.max(1, h.swDist.length) * step + 1.3f * rowH + 4 * sc
                     : 8 * step + 3 * sec + 1.3f * rowH + 4 * sc;
             bodyH += tabH;
@@ -3551,19 +3630,23 @@ public class TTSHornPad extends ContentProvider implements Application.ActivityL
             if (!h.lightsOn) return;
             float y = top + rowH + 12 * sc;
             // r166: page tabs LIGHTS | LOCO
-            float tw = (panelW - 12 * sc) / 3f, th = rh * 0.85f;
-            String[] tabs = {"LIGHTS", "LOCO", "POINTS"};
-            for (int t = 0; t < 3; t++) {
+            float tw = (panelW - 12 * sc) / 4f, th = rh * 0.85f;
+            String[] tabs = {"LIGHTS", "LOCO", "POINTS", "OTHERS"};
+            for (int t = 0; t < 4; t++) {
                 boolean sel = h.cpPage == t;
                 float tx = L + 6 * sc + t * tw;
                 box(c, tx + 1 * sc, y, tw - 2 * sc, th, sel ? 0xF024406E : 0xF0101C30);
                 if (sel) box(c, tx + 1 * sc, y + th - 3 * sc, tw - 2 * sc, 3 * sc, 0xFFFF8A1E);
-                textC(c, tabs[t], tx, y, tw, th, Math.min(fsSmall, tw / 4.2f), sel ? 0xFFFFB733 : 0xFF8A97AD, true);
+                textC(c, tabs[t], tx, y, tw, th, Math.min(fsSmall, tw / 4.6f), sel ? 0xFFFFB733 : 0xFF8A97AD, true);
                 hit(tx, y, tx + tw, y + th, 50 + t);
             }
             y += th + 8 * sc;
             if (h.cpPage == 2) {
                 drawPoints(c, h, L, y, panelW, rh, step, sec, fs, fsSmall);
+                return;
+            }
+            if (h.cpPage == 3) {
+                drawOthers(c, h, L, y, panelW, rh, step, sec, fs, fsSmall);
                 return;
             }
             if (h.cpPage == 1) {

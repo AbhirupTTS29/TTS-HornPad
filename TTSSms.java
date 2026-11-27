@@ -184,7 +184,7 @@ public final class TTSSms {
                     post(23);
                     // r158: a powered electric loco starts with its circuit breaker closed: the idling (blower /
                     // auxiliaries) loop of the .sms (CircuitBreakerClosed 152) runs from the start
-                    post(157);
+                    // TTS base: no CircuitBreakerClosingAuthorizationOn (157) - the WAP7 .sms beeps on it until 158
                     post(152);
                 }
                 post(13);
@@ -209,7 +209,7 @@ public final class TTSSms {
                 post(23);            // EnginePowerOn
                 // r158: Open Rails electric loco power-up: the circuit breaker gets its closing authorisation,
                 // closes after the pantograph is up (blower start sound, then the idling blower / auxiliaries loop)
-                post(157);           // CircuitBreakerClosingAuthorizationOn
+                // TTS base: no 157 (CircuitBreakerClosingAuthorizationOn): its beeping loop never stopped
                 later(151, 2.0);     // CircuitBreakerClosing
                 later(152, 3.5);     // CircuitBreakerClosed
             } else if (pp == 0 && inP > 0) {
